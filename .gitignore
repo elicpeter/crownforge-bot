@@ -1,0 +1,9 @@
+/target
+/sim
+/.venv
+/runs
+__pycache__/
+*.so
+*.pyc
+*.onnx
+.pytest_cache/

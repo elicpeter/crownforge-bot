@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cfbot"
+version = "0.1.0"
+description = "Neural network agent and self-play training for the Crownforge simulator"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "torch>=2.4"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+export = ["onnx", "onnxruntime"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "cfbot._env"
+features = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

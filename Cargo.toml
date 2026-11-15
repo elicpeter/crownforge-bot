@@ -1,0 +1,22 @@
+[package]
+name = "cfbot-env"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "_env"
+crate-type = ["cdylib"]
+
+[dependencies]
+# `sim` is a git-ignored symlink to a crownforge checkout (see README).
+crownforge-core = { path = "sim/crates/core" }
+crownforge-train = { path = "sim/crates/train" }
+numpy = "0.30"
+pyo3 = "0.30"
+rayon = "1.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
