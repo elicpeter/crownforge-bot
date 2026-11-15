@@ -7,7 +7,10 @@ The exported graph is the deployment interface of :class:`cfbot.agent.Agent`:
     inputs   the public observation planes, in ``cfbot.env.POLICY_KEYS`` order
     outputs  ``log_probs`` [rows, 4611]  log-probability of every simulator
                                          action, -inf where illegal
-             ``value``     [rows]        estimated outcome in [-1, 1]
+             ``value``     [rows]        public value estimate: the expected
+                                         return, which includes the shaped
+                                         reward while shaping is on, over a
+                                         support of about [-1.5, 1.5]
 
 The policy has no hidden memory, so each call is independent. A caller picks an
 action from ``log_probs`` and passes its index to the simulator's
@@ -41,10 +44,11 @@ def main() -> None:
     parser.add_argument("checkpoint")
     parser.add_argument("output")
     parser.add_argument("--rows", type=int, default=2, help="rows in the example batch")
+    parser.add_argument("--ema", action="store_true", help="export the averaged weights")
     args = parser.parse_args()
 
     env = Env(max(1, args.rows // 2), workers=1, exclude_cards=DRAFT_CARDS)
-    model, _ = load_policy(args.checkpoint, env.spec, torch.device("cpu"))
+    model, _ = load_policy(args.checkpoint, env.spec, torch.device("cpu"), ema=args.ema)
     deploy = Deploy(model).eval()
 
     # Play a little so the example has units on the board.
@@ -55,7 +59,8 @@ def main() -> None:
 
     names = list(POLICY_KEYS)
     dynamic = {name: {0: "rows"} for name in names}
-    dynamic["entities"][1] = dynamic["entity_mask"][1] = "entities"
+    for name in ("entities", "entity_extras", "entity_mask"):
+        dynamic[name][1] = "entities"
     dynamic.update({"log_probs": {0: "rows"}, "value": {0: "rows"}})
     torch.onnx.export(
         deploy,

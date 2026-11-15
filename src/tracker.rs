@@ -1,97 +1,73 @@
-//! Public play history for one side of a battle.
+//! What a player can count about one side from public events: which deck card
+//! was played when, the cycle position that follows from it, and elixir.
 //!
-//! Everything recorded here is visible to both players in a real match: which
-//! card a side deployed, where, when and at what cost. The featurizer shows a
-//! viewer its own full deck and only the opponent cards revealed so far.
+//! The simulator's own public play journal supplies the play history shown to
+//! the policy. This tracker adds the two things that journal does not carry:
+//! the card cycle and an elixir count.
 
-use crownforge_core::{CardId, Point, rules::MatchRules};
+use crownforge_core::{CardId, rules::ELIXIR_UNIT, rules::MatchRules};
 
-pub const MAX_EVENTS: usize = 32;
-
-#[derive(Clone, Copy)]
-pub struct PlayEvent {
-    /// The card as it resolved on the board (Mirror shows the copied card).
-    pub card: CardId,
-    pub level: u8,
-    /// World coordinates of the deployment.
-    pub position: Point,
-    pub tick: u32,
-}
+/// Cards waiting between a play and their return to the hand.
+pub const QUEUE_LEN: u32 = 4;
 
 #[derive(Clone)]
 pub struct Tracker {
     pub deck: [CardId; 8],
-    /// Newest last, at most `MAX_EVENTS`.
-    pub events: Vec<PlayEvent>,
+    /// Card level per deck slot.
+    pub levels: [u8; 8],
     /// Value of `plays` when each deck card was last played; 0 means never.
-    pub last_play: [u32; 8],
-    pub last_tick: [u32; 8],
-    pub times: [u16; 8],
-    /// Order in which deck cards were first revealed; `u8::MAX` means hidden.
-    pub reveal_rank: [u8; 8],
-    pub revealed: u8,
+    last_play: [u32; 8],
     pub plays: u32,
-    /// Elixir counted from public information: regeneration minus observed spending.
+    /// Elixir counted from public information: regeneration minus observed
+    /// card and ability spending.
     pub est_elixir: i32,
 }
 
 impl Tracker {
-    pub fn new(deck: [CardId; 8], initial_elixir: i32) -> Self {
+    pub fn new(deck: [CardId; 8], levels: [u8; 8], initial_elixir: i32) -> Self {
         Self {
             deck,
-            events: Vec::with_capacity(MAX_EVENTS + 1),
+            levels,
             last_play: [0; 8],
-            last_tick: [0; 8],
-            times: [0; 8],
-            reveal_rank: [u8::MAX; 8],
-            revealed: 0,
             plays: 0,
             est_elixir: initial_elixir,
         }
     }
 
-    pub fn reset(&mut self, deck: [CardId; 8], initial_elixir: i32) {
-        self.deck = deck;
-        self.events.clear();
-        self.last_play = [0; 8];
-        self.last_tick = [0; 8];
-        self.times = [0; 8];
-        self.reveal_rank = [u8::MAX; 8];
-        self.revealed = 0;
-        self.plays = 0;
-        self.est_elixir = initial_elixir;
+    pub fn reset(&mut self, deck: [CardId; 8], levels: [u8; 8], initial_elixir: i32) {
+        *self = Self::new(deck, levels, initial_elixir);
     }
 
-    pub fn record(
-        &mut self,
-        raw: CardId,
-        card: CardId,
-        level: u8,
-        position: Point,
-        tick: u32,
-        cost: u8,
-    ) {
+    /// Record an accepted play of the deck card `raw` (the card that left the
+    /// hand, so Mirror counts as Mirror) costing `cost` elixir.
+    pub fn record(&mut self, raw: CardId, cost: u8) {
         self.plays += 1;
-        if let Some(index) = self.deck.iter().position(|&c| c == raw) {
+        if let Some(index) = self.deck.iter().position(|&card| card == raw) {
             self.last_play[index] = self.plays;
-            self.last_tick[index] = tick;
-            self.times[index] = self.times[index].saturating_add(1);
-            if self.reveal_rank[index] == u8::MAX {
-                self.reveal_rank[index] = self.revealed;
-                self.revealed += 1;
-            }
         }
-        if self.events.len() == MAX_EVENTS {
-            self.events.remove(0);
-        }
-        self.events.push(PlayEvent {
-            card,
-            level,
-            position,
-            tick,
-        });
-        self.est_elixir =
-            (self.est_elixir - i32::from(cost) * crownforge_core::rules::ELIXIR_UNIT).max(0);
+        self.spend(u32::from(cost));
+    }
+
+    /// Subtract a visible payment of whole elixir, such as an ability.
+    pub fn spend(&mut self, elixir: u32) {
+        self.est_elixir = (self.est_elixir - elixir as i32 * ELIXIR_UNIT).max(0);
+    }
+
+    /// Add a visible elixir gain, in elixir units, up to the cap.
+    pub fn grant(&mut self, units: i32, cap: i32) {
+        self.est_elixir = (self.est_elixir + units).min(cap);
+    }
+
+    /// Plays by this side since the card in deck slot `index` was last played;
+    /// `None` if it has not been played. The cycle is a queue of
+    /// [`QUEUE_LEN`]: a card played fewer than that many plays ago is still
+    /// waiting, and every other card is in the hand or arriving.
+    pub fn plays_since(&self, index: usize) -> Option<u32> {
+        (self.last_play[index] != 0).then(|| self.plays - self.last_play[index])
+    }
+
+    pub fn slot_of(&self, card: CardId) -> Option<usize> {
+        self.deck.iter().position(|&c| c == card)
     }
 
     /// Apply regeneration for `ticks` ticks starting at `start_tick`.

@@ -17,8 +17,9 @@ Actor
 4. Action: a pointer over [wait, hand cards, abilities] picks what to do; the
    chosen card's query then modulates the board image to pick one of 576 cells.
 
-There is no recurrent memory. What a player must remember - elixir counts, the
-opponent's revealed cards and card cycle, recent plays - is in the input.
+There is no recurrent memory. What a player must remember is in the input:
+elixir counts, the opponent's revealed cards and where each sits in the card
+cycle, recent plays, deploy and stun timers, unit velocity and button state.
 
 Critic
 ------
@@ -133,8 +134,8 @@ class Embedder(nn.Module):
     """Turns raw schema-2 planes into token embeddings. The actor and the
     critic each own one, so they share no weights."""
 
-    GLOBAL_FEATURES = 11
-    ENTITY_FEATURES = 21
+    GLOBAL_FEATURES = 15
+    ENTITY_FEATURES = 26
 
     def __init__(self, spec: dict, dim: int, d_card: int, bands: int):
         super().__init__()
@@ -158,6 +159,7 @@ class Embedder(nn.Module):
         self.tower_emb = nn.Embedding(5, dim, padding_idx=0)
         self.side_emb = nn.Embedding(2, dim)
         self.hazard_emb = nn.Embedding(spec["n_hazards"], dim, padding_idx=0)
+        self.play_rank = nn.Parameter(torch.randn(spec["play_rows"], dim) * 0.02)
         self.type_emb = nn.Parameter(torch.randn(6, dim) * 0.02)
         self.slot_emb = nn.Parameter(torch.randn(4, dim) * 0.02)
         self.in_hand_emb = nn.Parameter(torch.randn(2, dim) * 0.02)
@@ -168,12 +170,15 @@ class Embedder(nn.Module):
         self.hand_card = nn.Linear(d_card * 2, dim)
         self.hand_feat = nn.Linear(4, dim)
         self.deck_card = nn.Linear(d_card, dim)
+        self.deck_feat = nn.Linear(spec["deck_x_f"], dim)
+        self.ability_feat = nn.Linear(spec["ability_f"] - 1, dim)
         self.reveal_card = nn.Linear(d_card, dim)
-        self.reveal_feat = nn.Linear(2, dim)
+        self.reveal_feat = nn.Linear(2 + spec["reveal_x_f"], dim)
         self.play_card = nn.Linear(d_card, dim)
         self.play_feat = nn.Linear(4 + four, dim)
         self.norms = nn.ModuleDict({name: nn.LayerNorm(dim) for name in
-                                    ("entity", "hazard", "glob", "hand", "deck", "reveal", "play")})
+                                    ("entity", "hazard", "glob", "hand", "deck", "reveal", "play",
+                                     "ability")})
 
     def cards(self, tokens: torch.Tensor) -> torch.Tensor:
         ids = tokens.long()
@@ -200,6 +205,10 @@ class Embedder(nn.Module):
                 glob[:, 2] / 2.0,
                 extras[:, 0] / self.max_elixir,
                 extras[:, 1],
+                extras[:, 2],
+                extras[:, 3],
+                extras[:, 4],
+                extras[:, 5],
             ],
             dim=-1,
         )
@@ -217,6 +226,7 @@ class Embedder(nn.Module):
                 ent[..., 10:19],
                 ent[..., 19:20] / 4.0,
                 ent[..., 20:24],
+                obs["entity_extras"],
                 fourier(xy, self.bands),
             ],
             dim=-1,
@@ -233,6 +243,15 @@ class Embedder(nn.Module):
         )
         out["entity_mask"] = obs["entity_mask"].bool()
         out["entity_xy"] = ent[..., 4:6]
+        out["entity_side"] = ent[..., 1]
+
+        ability = obs["abilities"]
+        button = ability[..., 0].long()
+        out["ability"] = self.norms["ability"](
+            self.unit_emb(button)
+            + self.unit_stats(self.unit_table[button])
+            + self.ability_feat(ability[..., 1:])
+        )
 
         haz = obs["hazards"]
         hxy = haz[..., 2:4] * 2 - 1
@@ -264,14 +283,21 @@ class Embedder(nn.Module):
         deck = obs["own_deck"]
         in_hand = (deck[..., 0].unsqueeze(-1) == hand[..., 0].unsqueeze(-2)).any(-1)
         out["deck"] = self.norms["deck"](
-            self.deck_card(self.cards(deck[..., 0])) + self.in_hand_emb[in_hand.long()] + self.type_emb[2]
+            self.deck_card(self.cards(deck[..., 0]))
+            + self.deck_feat(obs["deck_extras"])
+            + self.in_hand_emb[in_hand.long()]
+            + self.type_emb[2]
         )
 
         reveal = obs["revealed_deck"]
         age = ((tick.unsqueeze(-1) - reveal[..., 1]) / 600.0).clamp(0, 3)
         out["reveal"] = self.norms["reveal"](
             self.reveal_card(self.cards(reveal[..., 0]))
-            + self.reveal_feat(torch.stack([age, reveal[..., 2] / 10.0], dim=-1))
+            + self.reveal_feat(
+                torch.cat(
+                    [torch.stack([age, reveal[..., 2] / 10.0], dim=-1), obs["reveal_extras"]], dim=-1
+                )
+            )
             + self.type_emb[3]
         )
         out["reveal_mask"] = obs["reveal_mask"].bool()
@@ -282,13 +308,18 @@ class Embedder(nn.Module):
         play_features = torch.cat(
             [play[..., 3:4], pxy, age.unsqueeze(-1), fourier(pxy, self.bands)], dim=-1
         )
+        # Plays are stored oldest first; rank 0 is the newest one.
+        play_mask = obs["play_mask"].bool()
+        slots = torch.arange(play.shape[1], device=play.device)
+        rank = (play_mask.sum(-1, keepdim=True) - 1 - slots).clamp(0, play.shape[1] - 1)
         out["play"] = self.norms["play"](
             self.play_card(self.cards(play[..., 1]))
             + self.side_emb(play[..., 0].long())
             + self.play_feat(play_features)
+            + self.play_rank[rank]
             + self.type_emb[4]
         )
-        out["play_mask"] = obs["play_mask"].bool()
+        out["play_mask"] = play_mask
         return out
 
 
@@ -364,6 +395,9 @@ class Policy(nn.Module):
         self.board_base = nn.Parameter(torch.randn(1, BOARD_H, BOARD_W, c) * 0.02)
         self.board_global = nn.Linear(d, c)
         self.board_norm = nn.LayerNorm(c)
+        # Units per cell and side, added after the norm, which would otherwise
+        # hide how many units share a cell.
+        self.board_count = nn.Linear(2, c)
         self.board_blocks = nn.Sequential(*[NextBlock(c) for _ in range(config.board_blocks)])
         self.board_out = nn.LayerNorm(c)
         self.cell_token = nn.Linear(c, d)
@@ -428,12 +462,20 @@ class Policy(nn.Module):
         things = torch.cat([entities, tok["hazard"]], dim=1)
         thing_mask = torch.cat([entity_mask, tok["hazard_mask"]], dim=1)
         cells = self.to_board(things) * thing_mask.unsqueeze(-1).to(things.dtype)
-        index = self._cell_index(torch.cat([tok["entity_xy"], tok["hazard_xy"]], dim=1))
+        entity_cell = self._cell_index(tok["entity_xy"])
+        index = torch.cat([entity_cell, self._cell_index(tok["hazard_xy"])], dim=1)
         index = index.unsqueeze(-1).expand(-1, -1, cells.shape[-1])
         board = torch.zeros(n, BOARD_CELLS, cells.shape[-1], dtype=cells.dtype, device=cells.device)
         board = board.scatter_add(1, index, cells).view(n, BOARD_H, BOARD_W, -1)
         board = board + self.board_base.to(board.dtype) + self.board_global(tok["glob"])[:, None, None, :]
-        board = self.board_out(self.board_blocks(self.board_norm(board)))
+        side = tok["entity_side"].to(cells.dtype) * entity_mask.to(cells.dtype)
+        both = torch.stack([side, entity_mask.to(cells.dtype) - side], dim=-1)
+        counts = torch.zeros(n, BOARD_CELLS, 2, dtype=cells.dtype, device=cells.device)
+        counts = counts.scatter_add(1, entity_cell.unsqueeze(-1).expand(-1, -1, 2), both)
+        board = self.board_norm(board) + self.board_count(torch.log1p(counts)).view(
+            n, BOARD_H, BOARD_W, -1
+        )
+        board = self.board_out(self.board_blocks(board))
 
         parts = [entities, tok["hazard"], tok["deck"], tok["reveal"], tok["play"]]
         ones = torch.ones(n, 8, dtype=torch.bool, device=entities.device)
@@ -444,15 +486,17 @@ class Policy(nn.Module):
         memory = torch.cat(parts, dim=1)
         mask = torch.cat(masks, dim=1)
         queries = torch.cat(
-            [tok["glob"].unsqueeze(1), tok["hand"], self.ability_query.expand(n, -1, -1)], dim=1
+            [tok["glob"].unsqueeze(1), tok["hand"], self.ability_query + tok["ability"]], dim=1
         )
         for block in self.query_blocks:
             queries = block(queries, memory, mask)
         queries = self.query_norm(queries)
         glob, hand, abil = queries[:, 0], queries[:, 1:5], queries[:, 5:7]
-        trunk = self.trunk(
-            torch.cat([glob, hand.mean(1), board.mean((1, 2)), board.amax((1, 2))], dim=-1)
-        )
+        summary = torch.cat([glob, hand.mean(1), board.mean((1, 2)), board.amax((1, 2))], dim=-1)
+        # The public value and auxiliary heads read the trunk. Scale the gradient
+        # they send back so they inform the encoder without steering it.
+        scale = self.config.aux_grad_scale
+        trunk = self.trunk(summary.detach() + scale * (summary - summary.detach()))
         # Candidates: wait, four primary plays, four secondary plays, two abilities.
         cand = torch.cat(
             [glob.unsqueeze(1), hand + self.option_emb[0], hand + self.option_emb[1], abil], dim=1

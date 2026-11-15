@@ -35,6 +35,9 @@ class ModelConfig:
     value_bins: int = 61
     value_range: float = 1.5
     wait_bias: float = 2.0
+    # Share of the public-value and auxiliary gradient that reaches the actor
+    # encoder. At 1 those losses outweigh the policy loss there several times.
+    aux_grad_scale: float = 0.1
 
 
 MODEL_PRESETS = {
@@ -68,21 +71,35 @@ class TrainConfig:
     max_entities: int = 128
     exclude_cards: tuple[str, ...] = DRAFT_CARDS
     mirror_decks: bool = False
-    # Deck curriculum: "archetypes" uses the built-in list in decks.py, or give
-    # explicit decks. Each new battle draws a deck from the pool with
-    # probability pool_prob, otherwise a random deck; the probability anneals.
+    # Rules: None for the bundled level-11 rules, "complete" for the bundled bank
+    # with every card level, or a path to a rules document. level_jitter draws a
+    # per-card level offset from an inclusive range and needs rules that hold
+    # those levels ("complete").
+    rules: str | None = None
+    level_jitter: tuple[int, int] | None = None
+
+    # Decks. Each side of a new battle draws a pool deck with probability
+    # pool_prob, a pool deck with one to three cards replaced with probability
+    # mutant_prob, and a random playable deck otherwise. The pool is the
+    # archetype list in decks.py unless explicit decks are given. The shares
+    # move linearly to their final values over the first deck_ramp_frac of the
+    # run; random decks stay the largest source so every card keeps exposure.
     deck_pool: str | list[list[str]] | None = "archetypes"
-    pool_prob: float = 0.9
-    pool_prob_final: float = 0.3
-    pool_anneal_iters: int = 3_000
+    pool_prob: float = 0.10
+    mutant_prob: float = 0.20
+    pool_prob_final: float = 0.30
+    mutant_prob_final: float = 0.25
+    deck_ramp_frac: float = 0.15
 
     # Rollout and PPO
     rollout_steps: int = 128
     # Fresh experience is cheap here and the gradient step is the bottleneck,
-    # so each decision is used once.
+    # so each decision is used once by the policy.
     epochs: int = 1
-    # Decisions per gradient step. On Apple GPUs keep this within memory: the
-    # base model needs roughly 5 MB per decision. Raise it on larger GPUs.
+    # Extra passes of the critic alone over the rollout. It is small and separate.
+    critic_epochs: int = 1
+    # Decisions per gradient step. The base model keeps about 4 MB of
+    # activations per decision at full entity width; 2048 fits a 16 GB GPU.
     minibatch: int = 2048
     # Discount per decision_ticks of game time; longer steps discount more.
     gamma: float = 0.999
@@ -99,15 +116,18 @@ class TrainConfig:
     warmup_iters: int = 20
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
-    flip_augment: bool = True
+    # Show the acting policy a left-right mirrored view for half its decisions.
+    # Off by default: the simulator is not exactly mirror-symmetric.
+    flip_augment: bool = False
     amp: bool = True
-    compile: bool = False
+    # Moving average of the actor's weights, per gradient step. 0 disables.
+    ema_decay: float = 0.999
 
-    # Shaped reward, zero-sum between the two players, annealed to zero so the
-    # final objective is winning. Tower health is a potential; trade and leak
-    # are in elixir.
+    # Shaped reward, zero-sum between the two players, annealed to zero over
+    # the first shaping_anneal_frac of the run so the final objective is
+    # winning. Tower health is a potential; trade and leak are in elixir.
     shaping_coef: float = 1.0
-    shaping_anneal_iters: int = 4_000
+    shaping_anneal_frac: float = 0.25
     tower_coef: float = 0.5
     trade_coef: float = 0.01
     leak_coef: float = 0.02
@@ -116,16 +136,34 @@ class TrainConfig:
     self_play_frac: float = 0.6
     baseline_frac: float = 0.15
     baseline_frac_final: float = 0.02
-    baseline_anneal_iters: int = 2_000
+    baseline_anneal_frac: float = 0.15
     league_slots: int = 3
     league_refresh_iters: int = 10
     snapshot_iters: int = 50
     pfsp_power: float = 2.0
+    # Share of slot draws that ignore win rates, and how many of the newest
+    # snapshots the reserved "recent" slot draws from.
+    league_explore: float = 0.10
+    league_recent: int = 5
+    # Snapshots kept on disk besides the rating anchors; older ones are thinned.
+    max_snapshots: int = 300
+    # Train only against this checkpoint (an exploiter probe): no self-play,
+    # no scripted bots, no snapshots.
+    fixed_opponent: str | None = None
 
-    # Schedule and bookkeeping
+    # Schedule. Progress runs from 0 to 1 and drives every schedule above. With
+    # budget_hours it is elapsed training time over the budget, and the run
+    # stops when the budget is spent; otherwise it is iteration / total_iters.
     total_iters: int = 100_000
+    budget_hours: float | None = None
     log_iters: int = 1
     checkpoint_iters: int = 25
+
+    # Gauntlet: paired games against fixed anchors every gauntlet_frac of the
+    # run, on gauntlet_pairs deck pairs played from both seats. 0 disables.
+    gauntlet_frac: float = 0.02
+    gauntlet_pairs: int = 32
+    gauntlet_anchors: int = 6
 
     model: ModelConfig = field(default_factory=ModelConfig)
 
@@ -134,10 +172,19 @@ class TrainConfig:
 
     @staticmethod
     def from_dict(data: dict) -> "TrainConfig":
+        """Rebuild a config, ignoring settings that no longer exist."""
         data = dict(data)
-        model = ModelConfig(**data.pop("model", {}))
-        if data.get("exclude_cards") is not None:
-            data["exclude_cards"] = tuple(data["exclude_cards"])
+        model_data = data.pop("model", {})
+        model_fields = {f.name for f in dataclasses.fields(ModelConfig)}
+        model = ModelConfig(**{k: v for k, v in model_data.items() if k in model_fields})
+        known = {f.name for f in dataclasses.fields(TrainConfig)}
+        dropped = sorted(set(data) - known)
+        if dropped:
+            print(f"ignoring unknown config keys: {', '.join(dropped)}")
+        data = {k: v for k, v in data.items() if k in known}
+        for key in ("exclude_cards", "level_jitter"):
+            if data.get(key) is not None:
+                data[key] = tuple(data[key])
         return TrainConfig(model=model, **data)
 
 

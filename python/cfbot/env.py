@@ -9,15 +9,21 @@ from . import _env
 
 # Public inputs of the policy (simulator schema 2 plus bot-owned planes).
 POLICY_KEYS = (
-    "entities", "entity_mask", "global", "hand", "own_deck", "recent_plays", "play_mask",
-    "revealed_deck", "reveal_mask", "hazards", "hazard_mask", "extras", "legal",
+    "entities", "entity_extras", "entity_mask", "global", "abilities", "hand", "own_deck",
+    "deck_extras", "recent_plays", "play_mask", "revealed_deck", "reveal_extras", "reveal_mask",
+    "hazards", "hazard_mask", "extras", "legal",
 )
 # Hidden opponent state for the training-only critic.
 PRIVATE_KEYS = ("priv_global", "priv_hand", "priv_deck")
 OBS_KEYS = POLICY_KEYS + PRIVATE_KEYS
 # Keys whose second axis is the per-step entity width and must be padded
 # when steps are stacked.
-ENTITY_KEYS = ("entities", "entity_mask")
+ENTITY_KEYS = ("entities", "entity_extras", "entity_mask")
+# Step outputs that describe the transition rather than the next observation.
+INFO_KEYS = (
+    "reward", "trade", "leak", "ticks", "done", "truncated", "verdict", "final_towers", "outcome",
+    "episode_decisions", "episode_ticks", "entity_overflow", "hazard_overflow", "decks", "queued",
+)
 
 
 def card_ids(spec: dict, names) -> list[int]:
@@ -45,9 +51,11 @@ class Env:
         mirror_decks: bool = False,
         max_skip: int = 8,
         exclude_cards=(),
+        rules: str | None = None,
+        level_jitter: tuple[int, int] | None = None,
         device: torch.device | str = "cpu",
     ):
-        probe = _env.VecEnv(num_envs=1, workers=1)
+        probe = _env.VecEnv(num_envs=1, workers=1, rules=rules)
         spec = probe.spec()
         self.env = _env.VecEnv(
             num_envs=num_envs,
@@ -60,6 +68,8 @@ class Env:
             mirror_decks=mirror_decks,
             max_skip=max_skip,
             exclude_cards=card_ids(spec, exclude_cards),
+            rules=rules,
+            level_jitter=tuple(level_jitter) if level_jitter else None,
         )
         self.spec = self.env.spec()
         self.num_envs = num_envs
@@ -78,18 +88,24 @@ class Env:
     def step(self, actions: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict[str, np.ndarray]]:
         """Returns the next observation (on the device) and step info (numpy)."""
         raw = self.env.step(actions.detach().to("cpu", torch.int64).numpy())
-        info = {
-            key: raw[key]
-            for key in (
-                "reward", "trade", "leak", "ticks", "done", "truncated", "verdict",
-                "final_towers", "outcome", "episode_decisions", "episode_ticks",
-                "entity_overflow",
-            )
-        }
-        return self._obs(raw), info
+        return self._obs(raw), {key: raw[key] for key in INFO_KEYS}
 
-    def set_pool_prob(self, pool_prob: float) -> None:
-        self.env.set_pool_prob(pool_prob)
+    def set_mix(self, pool_prob: float, mutant_prob: float = 0.0) -> None:
+        """Deck sources for new episodes: chance of a pool deck, chance of a
+        mutated pool deck, random otherwise."""
+        self.env.set_mix(pool_prob, mutant_prob)
+
+    def set_pool(self, decks: list[list[str]], weights: list[float] | None = None) -> None:
+        self.env.set_pool([card_ids(self.spec, deck) for deck in decks], weights)
+
+    def queue_match(self, env: int, blue: list[int], red: list[int], seed: int | None = None) -> None:
+        """Make battle ``env``'s next episode this exact match (decks as card
+        tokens). The step output flags its result with ``queued``."""
+        self.env.queue_match(env, list(blue), list(red), seed)
+
+    def random_decks(self, count: int, seed: int) -> list[list[int]]:
+        """Random decks under the sampler's playability rules, as card tokens."""
+        return self.env.random_decks(count, seed)
 
     def crashes(self):
         return self.env.crashes()
@@ -100,6 +116,19 @@ class Env:
 
 def select_rows(obs: dict[str, torch.Tensor], rows: torch.Tensor) -> dict[str, torch.Tensor]:
     return {key: value[rows] for key, value in obs.items()}
+
+
+def trim_entities(obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Cut the entity axis to the longest row present, in steps of 16."""
+    mask = obs["entity_mask"]
+    longest = int(mask.sum(-1).max()) if mask.numel() else 0
+    width = min(mask.shape[-1], max(16, -(-longest // 16) * 16))
+    if width == mask.shape[-1]:
+        return obs
+    out = dict(obs)
+    for key in ENTITY_KEYS:
+        out[key] = obs[key][:, :width]
+    return out
 
 
 def tower_potential(towers: torch.Tensor) -> torch.Tensor:

@@ -9,10 +9,13 @@ mod decks;
 mod features;
 mod tracker;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use crownforge_core::{
-    Action, ActionVerdict, Battle, CardId, EntityKind, MatchConfig, Outcome, Point, Ruleset, Team,
+    Action, ActionVerdict, Battle, CardId, EntityKind, MatchConfig, Outcome, Ruleset, Team,
     UnitDefId, rules::ELIXIR_UNIT,
 };
 use crownforge_train::{PlayerObservation, grid};
@@ -21,7 +24,7 @@ use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 use rayon::prelude::*;
 
 use decks::{DeckSampler, Rng, mix64};
-use features::Rows;
+use features::{Motion, Rows};
 use tracker::Tracker;
 
 struct Context {
@@ -33,10 +36,20 @@ struct Context {
     max_skip: u32,
     time_limit_ticks: Option<u32>,
     master_seed: u64,
+    /// Inclusive range of per-card level offsets from the ruleset's level,
+    /// drawn independently for every card of both decks.
+    level_jitter: Option<(i32, i32)>,
 }
 
-/// A card play decoded before the step: spent card, shown card, level, place, cost.
-type PendingPlay = (CardId, CardId, u8, Point, u8);
+/// A payment decoded before the step: the deck card that leaves the hand (or
+/// `None` for an ability) and its elixir cost.
+type Payment = (Option<CardId>, u32);
+
+/// A match requested from Python for this slot's next episode.
+struct QueuedMatch {
+    decks: [[CardId; 8]; 2],
+    seed: Option<u64>,
+}
 
 struct Slot {
     index: usize,
@@ -44,12 +57,20 @@ struct Slot {
     battle: Battle,
     observations: [PlayerObservation; 2],
     trackers: [Tracker; 2],
+    motion: [Motion; 2],
+    queue: VecDeque<QueuedMatch>,
+    /// Whether the running episode came from the queue.
+    queued: bool,
     rows: Rows,
     decisions: u32,
     /// Troop health seen after the previous tick batch, keyed by creation
     /// sequence: remaining health, elixir value per health point, owner.
     health: HashMap<u64, (f32, f32, usize)>,
     health_next: HashMap<u64, (f32, f32, usize)>,
+    /// Living units that pay elixir to the other side when they die (Elixir
+    /// Golem and its parts), keyed by creation sequence: amount, owner.
+    bounties: HashMap<u64, (i32, usize)>,
+    bounties_next: HashMap<u64, (i32, usize)>,
     // Outputs of the latest step, describing the episode that was stepped.
     reward: [f32; 2],
     /// Elixir value of damage each side dealt to enemy troops this step.
@@ -64,6 +85,9 @@ struct Slot {
     final_towers: [[f32; 6]; 2],
     episode_decisions: u32,
     episode_ticks: u32,
+    /// Decks of the episode that just finished, and whether it was queued.
+    finished_decks: [[CardId; 8]; 2],
+    finished_queued: bool,
     deck_retries: u32,
     crashes: Vec<[[CardId; 8]; 2]>,
 }
@@ -88,13 +112,18 @@ impl Slot {
             battle,
             observations,
             trackers: [
-                Tracker::new(CardId::DEFAULT_DECK, initial),
-                Tracker::new(CardId::DEFAULT_DECK, initial),
+                Tracker::new(CardId::DEFAULT_DECK, [context.rules.level(); 8], initial),
+                Tracker::new(CardId::DEFAULT_DECK, [context.rules.level(); 8], initial),
             ],
+            motion: [Motion::default(), Motion::default()],
+            queue: VecDeque::new(),
+            queued: false,
             rows: Rows::new(max_entities),
             decisions: 0,
             health: HashMap::new(),
             health_next: HashMap::new(),
+            bounties: HashMap::new(),
+            bounties_next: HashMap::new(),
             reward: [0.0; 2],
             trade: [0.0; 2],
             leak: [0.0; 2],
@@ -106,15 +135,18 @@ impl Slot {
             final_towers: [[0.0; 6]; 2],
             episode_decisions: 0,
             episode_ticks: 0,
+            finished_decks: [CardId::DEFAULT_DECK; 2],
+            finished_queued: false,
             deck_retries: 0,
             crashes: Vec::new(),
         };
         slot.start_episode(context);
-        slot.featurize(context);
+        slot.featurize(context, 0);
         Ok(slot)
     }
 
-    /// Begin this slot's next episode with freshly sampled decks.
+    /// Begin this slot's next episode: a queued match if one is waiting,
+    /// otherwise freshly sampled decks.
     fn start_episode(&mut self, context: &Context) {
         let seed = mix64(
             context.master_seed
@@ -122,54 +154,101 @@ impl Slot {
                 ^ mix64(self.episode.wrapping_add(0xd1b5_4a32_d192_ed03)),
         );
         self.episode += 1;
-        let mut rng = Rng(seed);
+        let base = context.rules.level();
         let mut decks = [CardId::DEFAULT_DECK; 2];
+        let mut levels = [[base; 8]; 2];
         let mut started = false;
+        self.queued = false;
+        if let Some(request) = self.queue.pop_front() {
+            let seed = request.seed.unwrap_or(seed);
+            let mut rng = Rng(seed);
+            let config = Self::config(seed, &mut rng, request.decks, None);
+            if self.battle.reset(config).is_ok() {
+                decks = request.decks;
+                started = true;
+                self.queued = true;
+            } else {
+                self.deck_retries += 1;
+            }
+        }
+        let mut rng = Rng(seed);
         // Some card combinations are refused by the simulator; draw again.
         for _ in 0..32 {
-            decks = context.sampler.sample(&mut rng);
-            let config = MatchConfig {
-                seed,
-                battle_random_state: ((rng.next() >> 33) as i32).max(1),
-                decks,
-                shuffle: true,
-                native_deck_seeds: Some([
-                    ((rng.next() >> 33) as i32).max(1),
-                    ((rng.next() >> 33) as i32).max(1),
-                ]),
-                ..MatchConfig::default()
-            };
-            if self.battle.reset(config).is_ok() {
-                started = true;
+            if started {
                 break;
             }
-            self.deck_retries += 1;
+            decks = context.sampler.sample(&mut rng);
+            let card_levels = context.level_jitter.map(|(low, high)| {
+                let mut drawn = [[base; 8]; 2];
+                for level in drawn.iter_mut().flatten() {
+                    let offset = low + rng.below((high - low + 1) as usize) as i32;
+                    *level = (i32::from(base) + offset).clamp(1, 17) as u8;
+                }
+                drawn
+            });
+            let config = Self::config(seed, &mut rng, decks, card_levels);
+            if self.battle.reset(config).is_ok() {
+                levels = card_levels.unwrap_or(levels);
+                started = true;
+            } else {
+                self.deck_retries += 1;
+            }
         }
         if !started {
             decks = [CardId::DEFAULT_DECK; 2];
+            levels = [[base; 8]; 2];
             self.battle
                 .reset(MatchConfig {
                     seed,
+                    track_public_plays: true,
                     ..MatchConfig::default()
                 })
                 .expect("default match configuration is always accepted");
         }
         let initial = context.rules.timing().initial_elixir;
-        self.trackers[0].reset(decks[0], initial);
-        self.trackers[1].reset(decks[1], initial);
+        self.trackers[0].reset(decks[0], levels[0], initial);
+        self.trackers[1].reset(decks[1], levels[1], initial);
+        self.motion[0].clear();
+        self.motion[1].clear();
         self.decisions = 0;
         self.health.clear();
+        self.bounties.clear();
         PlayerObservation::refresh_pair(&self.battle, &mut self.observations, true);
     }
 
-    fn featurize(&mut self, context: &Context) {
-        for observation in &self.observations {
+    fn config(
+        seed: u64,
+        rng: &mut Rng,
+        decks: [[CardId; 8]; 2],
+        card_levels: Option<[[u8; 8]; 2]>,
+    ) -> MatchConfig {
+        MatchConfig {
+            seed,
+            battle_random_state: ((rng.next() >> 33) as i32).max(1),
+            decks,
+            shuffle: true,
+            native_deck_seeds: Some([
+                ((rng.next() >> 33) as i32).max(1),
+                ((rng.next() >> 33) as i32).max(1),
+            ]),
+            card_levels,
+            track_public_plays: true,
+            ..MatchConfig::default()
+        }
+    }
+
+    /// Write both players' rows. `elapsed` is the game time since the rows
+    /// were last written, for velocities; zero at the start of an episode.
+    fn featurize(&mut self, context: &Context, elapsed: u32) {
+        for (observation, motion) in self.observations.iter().zip(&mut self.motion) {
             features::featurize(
                 &context.rules,
                 &self.battle,
                 observation,
                 &self.trackers,
                 &mut self.rows,
+                motion,
+                elapsed,
             );
         }
     }
@@ -177,7 +256,15 @@ impl Slot {
     /// Credit each side with the elixir value of health its opponent's troops lost.
     fn account_damage(&mut self, rules: &Ruleset) {
         self.health_next.clear();
+        self.bounties_next.clear();
         for entity in self.battle.entities() {
+            if let Some(amount) = entity
+                .definition
+                .and_then(|unit| rules.unit(unit).death_reward)
+            {
+                self.bounties_next
+                    .insert(entity.sequence, (amount, entity.team.index()));
+            }
             let (EntityKind::Troop, Some(card)) = (entity.kind, entity.card) else {
                 continue;
             };
@@ -197,6 +284,14 @@ impl Slot {
             self.trade[1 - owner] += (before - after).max(0.0) * rate;
         }
         std::mem::swap(&mut self.health, &mut self.health_next);
+        // A death that pays elixir is visible to both players; count it.
+        let cap = rules.timing().max_elixir;
+        for (sequence, &(amount, owner)) in &self.bounties {
+            if !self.bounties_next.contains_key(sequence) {
+                self.trackers[1 - owner].grant(amount, cap);
+            }
+        }
+        std::mem::swap(&mut self.bounties, &mut self.bounties_next);
     }
 
     /// Advance the battle once and update everything derived from it.
@@ -204,7 +299,7 @@ impl Slot {
         &mut self,
         context: &Context,
         actions: [Action; 2],
-        plays: [Option<PendingPlay>; 2],
+        payments: [Option<Payment>; 2],
     ) -> [ActionVerdict; 2] {
         let timing = context.rules.timing();
         let start_tick = self.battle.tick();
@@ -225,9 +320,12 @@ impl Slot {
         for team in Team::ALL {
             let side = team.index();
             if result.verdicts[side] == ActionVerdict::Accepted
-                && let Some((raw, card, level, position, cost)) = plays[side]
+                && let Some((card, cost)) = payments[side]
             {
-                self.trackers[side].record(raw, card, level, position, start_tick, cost);
+                match card {
+                    Some(card) => self.trackers[side].record(card, cost as u8),
+                    None => self.trackers[side].spend(cost),
+                }
             }
             self.trackers[side].regenerate(timing, start_tick, result.actual_ticks);
             if self.battle.elixir(team) >= timing.max_elixir {
@@ -265,9 +363,10 @@ impl Slot {
         if stepped.is_ok() {
             return;
         }
+        self.finished_decks = [self.trackers[0].deck, self.trackers[1].deck];
+        self.finished_queued = self.queued;
         if self.crashes.len() < 64 {
-            self.crashes
-                .push([self.trackers[0].deck, self.trackers[1].deck]);
+            self.crashes.push(self.finished_decks);
         }
         for _ in 0..8 {
             let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -275,7 +374,7 @@ impl Slot {
                     .expect("default match configuration is always accepted");
                 self.observations = PlayerObservation::pair(&self.battle, true);
                 self.start_episode(context);
-                self.featurize(context);
+                self.featurize(context, 0);
             }));
             if rebuilt.is_ok() {
                 break;
@@ -296,7 +395,7 @@ impl Slot {
 
     fn step_inner(&mut self, context: &Context, indices: [i64; 2]) {
         let mut actions = [Action::Wait; 2];
-        let mut plays: [Option<PendingPlay>; 2] = [None; 2];
+        let mut payments: [Option<Payment>; 2] = [None; 2];
         let mut invalid = [false; 2];
         for side in 0..2 {
             let observation = &self.observations[side];
@@ -312,30 +411,30 @@ impl Slot {
                 continue;
             };
             actions[side] = action;
-            let (slot, view, position) = match action {
-                Action::Play { slot, position } => (
-                    slot,
-                    observation
-                        .resolved_hand
-                        .get(usize::from(slot))
-                        .copied()
-                        .flatten(),
-                    position,
-                ),
-                Action::PlayOption { slot, position, .. } => (
-                    slot,
-                    observation
-                        .secondary_hand
-                        .get(usize::from(slot))
-                        .copied()
-                        .flatten(),
-                    position,
-                ),
-                _ => continue,
+            let (slot, view) = match action {
+                Action::Play { slot, .. } => {
+                    (slot, observation.resolved_hand.get(usize::from(slot)))
+                }
+                Action::PlayOption { slot, .. } => {
+                    (slot, observation.secondary_hand.get(usize::from(slot)))
+                }
+                Action::Ability { target } => {
+                    // An ability costs elixir too, and the opponent sees it cast.
+                    let cost = observation
+                        .abilities
+                        .iter()
+                        .flatten()
+                        .find(|ability| ability.target == Some(target))
+                        .and_then(|ability| context.rules.unit(ability.definition).ability)
+                        .map_or(0, |ability| ability.cost);
+                    payments[side] = Some((None, cost));
+                    continue;
+                }
+                Action::Wait => continue,
             };
             let raw = observation.hand.get(usize::from(slot)).copied().flatten();
-            if let (Some(raw), Some(view)) = (raw, view) {
-                plays[side] = Some((raw, view.card, view.level.get(), position, view.cost));
+            if let (Some(raw), Some(Some(view))) = (raw, view) {
+                payments[side] = Some((Some(raw), u32::from(view.cost)));
             }
         }
 
@@ -344,7 +443,7 @@ impl Slot {
         self.leak = [0.0; 2];
         self.ticks = 0;
         self.outcome = -1;
-        let verdicts = self.advance(context, actions, plays);
+        let verdicts = self.advance(context, actions, payments);
         self.decisions += 1;
         for side in 0..2 {
             self.verdict[side] = match verdicts[side] {
@@ -367,12 +466,16 @@ impl Slot {
         }
         self.episode_decisions = 0;
         self.episode_ticks = 0;
+        let mut elapsed = self.ticks;
         if self.done {
             self.episode_decisions = self.decisions;
             self.episode_ticks = self.battle.tick();
+            self.finished_decks = [self.trackers[0].deck, self.trackers[1].deck];
+            self.finished_queued = self.queued;
             self.start_episode(context);
+            elapsed = 0;
         }
-        self.featurize(context);
+        self.featurize(context, elapsed);
     }
 }
 
@@ -394,13 +497,69 @@ fn card_from_vocab(rules: &Ruleset, id: usize) -> PyResult<CardId> {
         })
 }
 
+impl VecEnv {
+    /// Turn card tokens into a deck the simulator can run.
+    fn deck_from_vocab(&self, deck: &[usize]) -> PyResult<[CardId; 8]> {
+        deck_from_vocab(&self.context.rules, &self.context.sampler, deck)
+    }
+}
+
+fn deck_from_vocab(
+    rules: &Ruleset,
+    sampler: &DeckSampler,
+    deck: &[usize],
+) -> PyResult<[CardId; 8]> {
+    if deck.len() != 8 {
+        return Err(PyValueError::new_err("each deck needs exactly eight cards"));
+    }
+    let mut cards = [CardId::Knight; 8];
+    for (slot, &id) in cards.iter_mut().zip(deck) {
+        *slot = card_from_vocab(rules, id)?;
+    }
+    for (index, card) in cards.iter().enumerate() {
+        if cards[..index].contains(card) {
+            return Err(PyValueError::new_err(format!(
+                "deck lists {} twice",
+                card.name()
+            )));
+        }
+    }
+    if sampler.abilities(&cards) > 2 {
+        return Err(PyValueError::new_err(
+            "a deck may hold at most two ability units (the simulator's ability slots)",
+        ));
+    }
+    Ok(cards)
+}
+
+/// A pool deck: a runnable deck that uses no excluded card.
+fn pool_deck_from_vocab(
+    rules: &Ruleset,
+    sampler: &DeckSampler,
+    deck: &[usize],
+) -> PyResult<[CardId; 8]> {
+    let cards = deck_from_vocab(rules, sampler, deck)?;
+    match cards.iter().find(|&&card| !sampler.allows(card)) {
+        Some(card) => Err(PyValueError::new_err(format!(
+            "pool deck uses excluded card {}",
+            card.name()
+        ))),
+        None => Ok(cards),
+    }
+}
+
 #[pymethods]
 impl VecEnv {
     /// Card ids are card tokens: `CardId::index() + 1`, as listed by `spec()`.
+    ///
+    /// `rules` is `None` for the bundled level-11 rules, `"complete"` for the
+    /// bundled bank with every card level, or a path to a rules document.
+    /// `level_jitter` draws a level offset per card from an inclusive range and
+    /// needs rules that hold those levels.
     #[new]
     #[pyo3(signature = (num_envs, workers=0, decision_ticks=6, seed=0, max_entities=128,
                         deck_pool=None, pool_prob=1.0, mirror_decks=false, exclude_cards=None,
-                        time_limit_ticks=None, max_skip=8))]
+                        time_limit_ticks=None, max_skip=8, rules=None, level_jitter=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         num_envs: usize,
@@ -414,38 +573,37 @@ impl VecEnv {
         exclude_cards: Option<Vec<usize>>,
         time_limit_ticks: Option<u32>,
         max_skip: u32,
+        rules: Option<String>,
+        level_jitter: Option<(i32, i32)>,
     ) -> PyResult<Self> {
         if num_envs == 0 || decision_ticks == 0 || max_entities < 16 {
             return Err(PyValueError::new_err(
                 "num_envs and decision_ticks must be positive and max_entities at least 16",
             ));
         }
-        let rules = Ruleset::level11();
+        let rules = match rules.as_deref() {
+            None | Some("level11") => Ruleset::level11(),
+            Some("complete") => Ruleset::complete_level11(),
+            Some(path) => {
+                let bytes = std::fs::read(path)
+                    .map_err(|error| PyValueError::new_err(format!("{path}: {error}")))?;
+                Ruleset::from_json(&bytes)
+                    .map_err(|error| PyValueError::new_err(format!("{path}: {error:?}")))?
+            }
+        };
+        if level_jitter.is_some_and(|(low, high)| low > high) {
+            return Err(PyValueError::new_err("level_jitter needs low <= high"));
+        }
         let excluded = exclude_cards.unwrap_or_default();
         let allowed: Vec<CardId> = CardId::ALL
             .iter()
             .copied()
             .filter(|card| rules.supports_card(*card) && !excluded.contains(&(card.index() + 1)))
             .collect();
+        let mut sampler = DeckSampler::new(&rules, &allowed, mirror_decks);
         let mut pool_decks = Vec::new();
         for deck in deck_pool.unwrap_or_default() {
-            if deck.len() != 8 {
-                return Err(PyValueError::new_err("each deck needs exactly eight cards"));
-            }
-            let mut cards = [CardId::Knight; 8];
-            for (slot, id) in cards.iter_mut().zip(deck) {
-                *slot = card_from_vocab(&rules, id)?;
-            }
-            let abilities: u32 = cards
-                .iter()
-                .map(|&card| u32::from(decks::ability_units(&rules, card)))
-                .sum();
-            if abilities > 2 {
-                return Err(PyValueError::new_err(
-                    "a deck may hold at most two ability units (the simulator's ability slots)",
-                ));
-            }
-            pool_decks.push(cards);
+            pool_decks.push(pool_deck_from_vocab(&rules, &sampler, &deck)?);
         }
         if pool_decks.is_empty() && allowed.len() < 8 {
             return Err(PyValueError::new_err(
@@ -462,7 +620,7 @@ impl VecEnv {
             .thread_name(|index| format!("cfbot-env-{index}"))
             .build()
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let mut sampler = DeckSampler::new(&rules, &allowed, pool_decks, mirror_decks);
+        sampler.set_pool(pool_decks, &[]);
         sampler.pool_prob = pool_prob;
         let context = Context {
             sampler,
@@ -471,6 +629,7 @@ impl VecEnv {
             max_skip,
             time_limit_ticks,
             master_seed: seed,
+            level_jitter,
         };
         let slots = (0..num_envs)
             .map(|index| Slot::new(&context, index, max_entities))
@@ -489,9 +648,62 @@ impl VecEnv {
         self.slots.len()
     }
 
-    /// Chance that a new episode's deck comes from the pool rather than a random draw.
-    fn set_pool_prob(&mut self, pool_prob: f64) {
+    /// Deck sources for new episodes: the chance of a pool deck, the chance of
+    /// a pool deck with one to three cards replaced, and a random deck otherwise.
+    #[pyo3(signature = (pool_prob, mutant_prob=0.0))]
+    fn set_mix(&mut self, pool_prob: f64, mutant_prob: f64) {
         self.context.sampler.pool_prob = pool_prob;
+        self.context.sampler.mutant_prob = mutant_prob;
+    }
+
+    /// Replace the deck pool. `weights` are relative; omitted means uniform.
+    #[pyo3(signature = (decks, weights=None))]
+    fn set_pool(&mut self, decks: Vec<Vec<usize>>, weights: Option<Vec<f64>>) -> PyResult<()> {
+        let pool = decks
+            .iter()
+            .map(|deck| pool_deck_from_vocab(&self.context.rules, &self.context.sampler, deck))
+            .collect::<PyResult<Vec<_>>>()?;
+        let weights = weights.unwrap_or_default();
+        if !weights.is_empty() && weights.len() != pool.len() {
+            return Err(PyValueError::new_err("one weight per deck"));
+        }
+        self.context.sampler.set_pool(pool, &weights);
+        Ok(())
+    }
+
+    /// Queue an exact match as battle `env`'s next episode. Queued matches run
+    /// in order before sampled ones and are flagged in the step output, so an
+    /// evaluator can play a chosen deck pair once and count only that game.
+    #[pyo3(signature = (env, blue, red, seed=None))]
+    fn queue_match(
+        &mut self,
+        env: usize,
+        blue: Vec<usize>,
+        red: Vec<usize>,
+        seed: Option<u64>,
+    ) -> PyResult<()> {
+        let decks = [self.deck_from_vocab(&blue)?, self.deck_from_vocab(&red)?];
+        let slot = self
+            .slots
+            .get_mut(env)
+            .ok_or_else(|| PyValueError::new_err("no such battle"))?;
+        slot.queue.push_back(QueuedMatch { decks, seed });
+        Ok(())
+    }
+
+    /// `count` random decks under the sampler's playability rules, as card tokens.
+    fn random_decks(&self, count: usize, seed: u64) -> Vec<Vec<usize>> {
+        let mut rng = Rng(mix64(seed ^ 0x5eed_dec5));
+        (0..count)
+            .map(|_| {
+                self.context
+                    .sampler
+                    .random(&mut rng)
+                    .iter()
+                    .map(|card| card.index() + 1)
+                    .collect()
+            })
+            .collect()
     }
 
     /// Static description of every array this environment returns.
@@ -501,6 +713,18 @@ impl VecEnv {
         let timing = rules.timing();
         let d = PyDict::new(py);
         d.set_item("schema_version", SCHEMA_VERSION)?;
+        d.set_item("bot_schema", BOT_SCHEMA)?;
+        d.set_item("entity_x_f", ENTITY_X_F)?;
+        d.set_item("ability_f", ABILITY_F)?;
+        d.set_item("deck_x_f", DECK_X_F)?;
+        d.set_item("reveal_x_f", REVEAL_X_F)?;
+        let digest: String = rules
+            .digest()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        d.set_item("rules_digest", digest)?;
+        d.set_item("pool_decks", self.context.sampler.pool_len())?;
         d.set_item("num_actions", grid::ACTION_COUNT)?;
         d.set_item("grid_width", grid::WIDTH)?;
         d.set_item("grid_height", grid::HEIGHT)?;
@@ -580,7 +804,7 @@ impl VecEnv {
                         slot.episode = 0;
                     }
                     slot.start_episode(context);
-                    slot.featurize(context);
+                    slot.featurize(context, 0);
                 });
             });
         });
@@ -630,7 +854,16 @@ impl VecEnv {
         let mut outcome = Vec::with_capacity(self.slots.len());
         let mut decisions = Vec::with_capacity(self.slots.len());
         let mut episode_ticks = Vec::with_capacity(self.slots.len());
+        let mut decks = Vec::with_capacity(self.slots.len() * 16);
+        let mut queued = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
+            decks.extend(
+                slot.finished_decks
+                    .iter()
+                    .flatten()
+                    .map(|card| (card.index() + 1) as i16),
+            );
+            queued.push(slot.finished_queued);
             reward.extend_from_slice(&slot.reward);
             trade.extend_from_slice(&slot.trade);
             leak.extend_from_slice(&slot.leak);
@@ -655,6 +888,13 @@ impl VecEnv {
         d.set_item("outcome", outcome.into_pyarray(py))?;
         d.set_item("episode_decisions", decisions.into_pyarray(py))?;
         d.set_item("episode_ticks", episode_ticks.into_pyarray(py))?;
+        // Decks of the episode that finished in this step (where `outcome` is
+        // set), and whether that episode came from the match queue.
+        d.set_item(
+            "decks",
+            decks.into_pyarray(py).reshape([self.slots.len(), 2, 8])?,
+        )?;
+        d.set_item("queued", queued.into_pyarray(py))?;
         Ok(d)
     }
 
@@ -695,22 +935,35 @@ impl VecEnv {
         let width = longest.div_ceil(16).saturating_mul(16).min(cap);
 
         let mut entities = Vec::with_capacity(rows * width * ENTITY_F);
+        let mut entity_extras = Vec::with_capacity(rows * width * ENTITY_X_F);
         let mut entity_mask = Vec::with_capacity(rows * width);
         let mut overflow = Vec::with_capacity(rows);
+        let mut hazard_overflow = Vec::with_capacity(rows);
         for slot in &self.slots {
             for side in 0..2 {
                 entities.extend_from_slice(
                     &slot.rows.entities[side * cap * ENTITY_F..][..width * ENTITY_F],
                 );
+                entity_extras.extend_from_slice(
+                    &slot.rows.entity_extras[side * cap * ENTITY_X_F..][..width * ENTITY_X_F],
+                );
                 let count = slot.rows.n_entities[side];
                 entity_mask.extend((0..width).map(|index| u8::from(index < count)));
                 overflow.push(slot.rows.overflow[side]);
+                hazard_overflow.push(slot.rows.hazard_overflow[side]);
             }
         }
         d.set_item(
             "entities",
             entities.into_pyarray(py).reshape([rows, width, ENTITY_F])?,
         )?;
+        d.set_item(
+            "entity_extras",
+            entity_extras
+                .into_pyarray(py)
+                .reshape([rows, width, ENTITY_X_F])?,
+        )?;
+        d.set_item("hazard_overflow", hazard_overflow.into_pyarray(py))?;
         d.set_item(
             "entity_mask",
             entity_mask.into_pyarray(py).reshape([rows, width])?,
@@ -740,7 +993,14 @@ impl VecEnv {
         }
         gather!("global", global, [rows, GLOBAL_F]);
         gather!("hand", hand, [rows, 4, HAND_F]);
+        gather!("abilities", abilities, [rows, ABILITY_ROWS, ABILITY_F]);
         gather!("own_deck", own_deck, [rows, DECK_ROWS, DECK_F]);
+        gather!("deck_extras", deck_extras, [rows, DECK_ROWS, DECK_X_F]);
+        gather!(
+            "reveal_extras",
+            reveal_extras,
+            [rows, REVEAL_ROWS, REVEAL_X_F]
+        );
         gather!("recent_plays", plays, [rows, PLAY_ROWS, PLAY_F]);
         mask!("play_mask", n_plays, PLAY_ROWS);
         gather!("revealed_deck", reveals, [rows, REVEAL_ROWS, REVEAL_F]);

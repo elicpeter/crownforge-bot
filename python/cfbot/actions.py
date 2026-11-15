@@ -99,8 +99,10 @@ def flip_legal(legal: torch.Tensor) -> torch.Tensor:
 
 
 def flip_observation(obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Mirror an observation left-to-right. The arena is symmetric in x.
-    Coordinates are in [0, 1]; padded rows stay zero."""
+    """Mirror an observation left-to-right. Coordinates are in [0, 1]; padded
+    rows stay zero. The simulator is not exactly symmetric in x (formation
+    offsets, even-footprint buildings, tie breaks), so a mirrored view is only
+    ever shown to the policy while it acts; transitions are never relabelled."""
     out = dict(obs)
     for key, column, mask_key in (
         ("entities", 4, "entity_mask"),
@@ -113,5 +115,19 @@ def flip_observation(obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
             present = present & (values[..., 3] > 0)
         values[..., column] = torch.where(present, 1 - values[..., column], values[..., column])
         out[key] = values
+    # Velocity along x changes sign with the mirror.
+    extras = obs["entity_extras"].clone()
+    extras[..., 3] = -extras[..., 3]
+    out["entity_extras"] = extras
     out["legal"] = flip_legal(obs["legal"])
+    return out
+
+
+def flip_rows(obs: dict[str, torch.Tensor], rows: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Mirror only the rows where ``rows`` is true."""
+    flipped = flip_observation(obs)
+    out = dict(obs)
+    for key in ("entities", "recent_plays", "hazards", "entity_extras", "legal"):
+        mask = rows.view(-1, *([1] * (obs[key].dim() - 1)))
+        out[key] = torch.where(mask, flipped[key], obs[key])
     return out
