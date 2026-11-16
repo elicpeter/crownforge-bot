@@ -59,6 +59,9 @@ const TICKS_PER_SECOND: f32 = 20.0;
 /// pocket a fallen princess tower opens in its lane.
 const OWN_ROWS: usize = 15;
 const POCKET_ROWS: usize = 21;
+/// The river, and the columns of the left and right bridge across it.
+const RIVER_ROWS: (usize, usize) = (15, 17);
+const BRIDGE_COLUMNS: [(usize, usize); 2] = [(2, 5), (13, 16)];
 
 pub fn token(def: usize) -> f32 {
     (def + 1) as f32
@@ -418,10 +421,20 @@ pub fn featurize(meta: &Meta, view: &View, tracker: &Tracker, rows: &mut Rows) {
             continue;
         }
         cells[..OWN_ROWS * WIDTH].fill(1);
+        // The engine also takes the two river rows of an open pocket, but a
+        // ground troop put in the water off the bridge never leaves it. Those
+        // tiles are offered only to what flies, jumps or does not walk.
+        let wades = d.flying || d.jumps_river || d.ctype == CardType::Building;
         for lane in 0..2 {
             if open[lane] {
                 for y in OWN_ROWS..POCKET_ROWS {
-                    cells[y * WIDTH + lane * (WIDTH / 2)..][..WIDTH / 2].fill(1);
+                    let row = &mut cells[y * WIDTH + lane * (WIDTH / 2)..][..WIDTH / 2];
+                    if y >= RIVER_ROWS.0 && y < RIVER_ROWS.1 && !wades {
+                        let bridge = BRIDGE_COLUMNS[lane];
+                        row[bridge.0 - lane * (WIDTH / 2)..bridge.1 - lane * (WIDTH / 2)].fill(1);
+                    } else {
+                        row.fill(1);
+                    }
                 }
             }
         }

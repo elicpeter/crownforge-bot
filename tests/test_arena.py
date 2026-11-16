@@ -239,6 +239,72 @@ def test_bridge_rows_equal_the_client_rows():
     assert plays > 150 and reveals >= 8
 
 
+def test_a_spawner_elsewhere_does_not_hide_a_spell():
+    """A Tombstone in one lane used to explain every new skeleton, so a
+    Graveyard cast in the other lane was never seen."""
+    cr_sim = pytest.importorskip("cr_sim")
+    mine = ["knight", "archers", "giant", "musketeer", "skeletons", "fireball", "arrows", "zap"]
+    theirs = ["tombstone", "graveyard", "knight", "archers", "giant", "musketeer", "ice_spirit", "zap"]
+    battle = cr_sim.Battle()
+    battle.reset(35, mine, theirs)
+    feat = cfbot_arena.Featurizer(mine, DT)
+    names = feat.card_names()
+    done = set()
+    for tick in range(2400):
+        feat.update(battle.view(0).observe())
+        action = None
+        view = battle.view(1)
+        hand, elixir = view.hand(), view.elixir()
+        if "tombstone" not in done and "tombstone" in hand and elixir >= 3:
+            action = (hand.index("tombstone"), 14.5, 5.5)
+            done.add("tombstone")
+        elif "tombstone" in done and "graveyard" not in done and "graveyard" in hand and elixir >= 5:
+            action = (hand.index("graveyard"), 3.5, 25.5)
+            done.add("graveyard")
+            cast = tick
+        elif "graveyard" not in done and elixir >= 9.5:
+            slot = next(i for i, card in enumerate(hand) if card not in ("tombstone", "graveyard"))
+            action = (slot, 9.5, 2.5)
+        if battle.step(None, action):
+            break
+        if "graveyard" in done and tick > cast + 120:
+            break
+    assert done == {"tombstone", "graveyard"}
+    rows = feat.observe()
+    seen = {names[int(token)] for token in rows["revealed_deck"][0, :, 0] if token}
+    assert {"tombstone", "graveyard"} <= seen
+
+
+def test_ground_troops_are_not_offered_the_water():
+    env = cfbot_arena.VecEnv(num_envs=48, workers=4, seed=6)
+    spec = env.spec()
+    units = spec["unit_table"]
+    cards = spec["card_table"]
+    obs = env.reset(6)
+    rng = np.random.default_rng(6)
+    river = np.zeros((A.HEIGHT, A.WIDTH), dtype=bool)
+    river[15:17] = True
+    off_bridge = river.copy()
+    off_bridge[:, 2:5] = False
+    off_bridge[:, 13:16] = False
+    checked = wet = 0
+    for _ in range(900):
+        legal = obs["legal"][:, 1:A.PLAY_ACTION_COUNT].reshape(-1, 4, A.HEIGHT, A.WIDTH).astype(bool)
+        played = obs["hand"][:, :, 1].astype(int)
+        for row, slot in zip(*np.nonzero(legal[:, :, 15:21].any((-1, -2)) & ~legal[:, :, 21:].any((-1, -2)))):
+            token = played[row, slot]
+            walks = not (units[token, 8] or units[token, 22] or units[token, 14])
+            checked += 1
+            if walks:
+                assert not (legal[row, slot] & off_bridge).any()
+                assert (legal[row, slot] & river).any()
+            else:
+                wet += int((legal[row, slot] & off_bridge).any())
+        obs = env.step(random_actions(obs, rng, 0.5))
+    assert checked > 50 and wet > 0
+    assert cards.shape[0] == len(spec["card_names"])
+
+
 def test_make_env_and_scripted_bots():
     env = make_env(8, simulator="arena", seed=3, exclude_cards=("MergeMaiden",), pool_prob=0.5,
                    deck_pool=list(ARENA_ARCHETYPES.values()))

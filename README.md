@@ -459,12 +459,14 @@ Only what the server sends, which is less than the other simulators show:
   plane is always empty and the status columns of the entity plane are zero.
 - **The opponent's cards** are inferred from the units that appear on its
   side ([arena/src/track.rs](arena/src/track.rs)): units that something
-  already on the board produced (a hut, a Witch, a death spawn) are not counted
-  as plays; a Goblin Barrel or Graveyard is recognised by its units. A spell
-  that leaves no unit (Fireball, Zap, Poison, The Log, ...) is never seen.
+  standing or dying within three tiles of them produced (a hut, a Witch, a
+  death spawn, a champion's summons) are not counted as plays; a Goblin Barrel
+  or Graveyard is recognised by its units. A spell that leaves no unit
+  (Fireball, Zap, Poison, The Log, ...) is never seen, and a spell that drops
+  units next to a spawner of the same units is taken for the spawner's work.
 - **The opponent's elixir** is counted from those inferred plays, so it is an
-  upper bound: it does not know about unseen spells, Mirror's surcharge or an
-  Elixir Collector.
+  estimate that can be wrong either way: too high after an unseen spell or a
+  Mirror, too low while an Elixir Collector pays out.
 - **Own state** is exact: hand, next card, the card cycle, what Mirror would
   replay, a card's evolution charge, and the champion's ability cooldown, all
   counted from the bot's own accepted moves.
@@ -477,8 +479,12 @@ deck, as before.
 The same 4,611 flat actions. A play is a hand slot and one of the 576 tiles in
 the player's own frame; both seats see themselves at the bottom, as on the
 server, so nothing is flipped anywhere. The legal mask follows the engine's own
-rule: troops and buildings on the fifteen own rows, plus rows 15 to 20 of a lane
-whose enemy princess tower has fallen; spells, Miner and Goblin Drill anywhere.
+rule with one exception: troops and buildings on the fifteen own rows, plus
+rows 15 to 20 of a lane whose enemy princess tower has fallen; spells, Miner
+and Goblin Drill anywhere. The exception is the two river rows of such a
+pocket: the engine takes a ground troop there, off the bridge, and the troop
+then never leaves the water, so those tiles are offered only on the bridges
+unless the unit flies, jumps the river or is a building.
 The ability action fires the champion's ability when it is on the board, off
 cooldown and paid for (and, for the Golden Knight's dash, with an enemy in
 reach). Goblinstein's revive is not offered. The secondary play forms do not

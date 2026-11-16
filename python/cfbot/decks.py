@@ -84,10 +84,13 @@ ARENA_CANDIDATES = {
     "royal_giant_control": ["royal_giant", "hunter", "knight", "skeletons", "tesla", "lightning", "the_log", "firecracker"],
     "barrel_air_bait": ["goblin_barrel", "princess", "goblin_gang", "minions", "knight", "inferno_tower", "royal_delivery", "the_log"],
     "drill_wall_breakers": ["goblin_drill", "wall_breakers", "knight", "firecracker", "bats", "poison", "tesla", "the_log"],
-    "battle_ram_counterpush": ["battle_ram", "bandit", "giant_skeleton", "electro_wizard", "dark_prince", "minions", "royal_delivery", "zap"],
+    "battle_ram_counterpush": ["battle_ram", "knight", "giant_skeleton", "electro_wizard", "dark_prince", "minions", "royal_delivery", "zap"],
 }
+# Bandit is swapped too: its dash can leave it frozen and untouchable for the
+# rest of the match. The built-in default deck stays as newcomers will run it.
+_SWAPS = {"barbarian_barrel": "the_log", "bandit": "knight"}
 ARENA_POOL = {
-    **{name: ["the_log" if card == "barbarian_barrel" else card for card in deck]
+    **{name: deck if name == "builtin_default" else [_SWAPS.get(card, card) for card in deck]
        for name, deck in ARENA_ARCHETYPES.items()},
     **ARENA_CANDIDATES,
 }

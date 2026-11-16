@@ -22,6 +22,8 @@ pub const ABILITY_SLOT: i32 = 100;
 pub const QUEUE_LEN: u32 = 4;
 pub const HISTORY: usize = 32;
 pub const MAX_ELIXIR: f64 = 10.0;
+/// How far, in tiles, new units may appear from the unit that made them.
+const SOURCE_REACH: f64 = 3.0;
 const REGULATION_TICKS: i64 = 3600;
 const DOUBLE_ELIXIR_AT: i64 = 2400;
 
@@ -69,8 +71,12 @@ impl Meta {
                     spawn_src[product].push(id);
                 }
             }
-            for product in [def.death_id, def.revive_as, def.ability_spawn_id].into_iter().flatten() {
+            for product in [def.death_id, def.revive_as].into_iter().flatten() {
                 death_src[product].push(id);
+            }
+            // A champion's summons arrive around the champion while it stands.
+            if let Some(product) = def.ability_spawn_id {
+                spawn_src[product].push(id);
             }
             if let Some(product) = def.deploy_spawn_id {
                 secondary_of[product] = Some(id);
@@ -125,6 +131,11 @@ pub struct Reveal {
 pub struct Mem {
     pub first: i64,
     last: i64,
+    def: usize,
+    /// An opponent's unit, not a tower.
+    enemy: bool,
+    /// Where it was on the latest tick it was seen.
+    pos: [f64; 2],
     snap: [f64; 2],
     /// Tiles per second over the last whole decision interval.
     pub velocity: [f32; 2],
@@ -157,8 +168,7 @@ pub struct Tracker {
     spell_seen: Vec<i64>,
     pub history: VecDeque<Play>,
     pub mem: HashMap<u32, Mem>,
-    prev_enemy: Vec<u16>,
-    cur_enemy: Vec<u16>,
+    gone: Vec<(usize, f64, f64)>,
     groups: Vec<(usize, u32, f64, f64)>,
     pub tick: i64,
     started: bool,
@@ -182,8 +192,7 @@ impl Tracker {
             spell_seen: vec![i64::MIN / 2; n],
             history: VecDeque::with_capacity(HISTORY),
             mem: HashMap::new(),
-            prev_enemy: vec![0; n],
-            cur_enemy: vec![0; n],
+            gone: Vec::new(),
             groups: Vec::new(),
             tick: 0,
             started: false,
@@ -205,8 +214,7 @@ impl Tracker {
         self.spell_seen.fill(i64::MIN / 2);
         self.history.clear();
         self.mem.clear();
-        self.prev_enemy.fill(0);
-        self.cur_enemy.fill(0);
+        self.gone.clear();
         self.tick = 0;
         self.started = false;
     }
@@ -312,21 +320,18 @@ impl Tracker {
         }
 
         // ---- units: first sight, velocity, and the opponent's new arrivals ----
-        self.cur_enemy.fill(0);
         self.groups.clear();
         let grid = decision_ticks > 0 && view.tick % decision_ticks == 0;
         let seconds = decision_ticks as f64 / 20.0;
         let mut champion = None;
         for e in &view.ents {
-            if !e.mine && !e.tower {
-                self.cur_enemy[e.def] += 1;
-            }
             if e.mine && champion.is_none() && meta.has_ability(e.def) {
                 champion = Some(e.id);
             }
             match self.mem.get_mut(&e.id) {
                 Some(mem) => {
                     mem.last = view.tick;
+                    mem.pos = [e.x, e.y];
                     if grid {
                         mem.velocity = [
                             ((e.x - mem.snap[0]) / seconds) as f32,
@@ -338,7 +343,15 @@ impl Tracker {
                 None => {
                     self.mem.insert(
                         e.id,
-                        Mem { first: view.tick, last: view.tick, snap: [e.x, e.y], velocity: [0.0; 2] },
+                        Mem {
+                            first: view.tick,
+                            last: view.tick,
+                            def: e.def,
+                            enemy: !e.mine && !e.tower,
+                            pos: [e.x, e.y],
+                            snap: [e.x, e.y],
+                            velocity: [0.0; 2],
+                        },
                     );
                     if !e.mine && !e.tower && self.started {
                         match self.groups.iter_mut().find(|g| g.0 == e.def) {
@@ -354,6 +367,13 @@ impl Tracker {
             }
         }
         let now = view.tick;
+        // Opponent units that left the board this tick, and where they stood.
+        self.gone.clear();
+        for mem in self.mem.values() {
+            if mem.last != now && mem.enemy {
+                self.gone.push((mem.def, mem.pos[0], mem.pos[1]));
+            }
+        }
         self.mem.retain(|_, mem| mem.last == now);
         match (champion, self.champion) {
             (Some(id), Some((old, _))) if id == old => {}
@@ -365,9 +385,10 @@ impl Tracker {
         self.groups.sort_by_key(|g| g.0);
         for index in 0..self.groups.len() {
             let (def, count, sum_x, sum_y) = self.groups[index];
-            if let Some(card) = self.card_behind(meta, def, count, view.tick) {
-                let x = (sum_x / count as f64) as f32;
-                let y = (sum_y / count as f64) as f32;
+            let centre = [sum_x / count as f64, sum_y / count as f64];
+            if let Some(card) = self.card_behind(meta, view, def, count, centre) {
+                let x = centre[0] as f32;
+                let y = centre[1] as f32;
                 self.opp_plays += 1;
                 let opp_plays = self.opp_plays;
                 if let Some(index) = self.reveals.iter().position(|r| r.card == card) {
@@ -382,7 +403,6 @@ impl Tracker {
                 self.push_play(Play { mine: false, card, x, y, tick: view.tick - 1 });
             }
         }
-        std::mem::swap(&mut self.prev_enemy, &mut self.cur_enemy);
 
         // ---- the opponent's elixir refills whether or not we saw it spent ----
         let from = if self.started { self.tick } else { view.tick };
@@ -403,11 +423,17 @@ impl Tracker {
 
     /// The card that put `count` new units of `def` on the opponent's side, or
     /// `None` if something already on the board made them.
-    fn card_behind(&mut self, meta: &Meta, def: usize, count: u32, tick: i64) -> Option<usize> {
+    fn card_behind(&mut self, meta: &Meta, view: &View, def: usize, count: u32, centre: [f64; 2]) -> Option<usize> {
         let lib = &meta.lib;
-        // `cur_enemy` is this tick's count and `prev_enemy` the last tick's.
-        let standing = meta.spawn_src[def].iter().any(|&s| self.cur_enemy[s] > 0 || self.prev_enemy[s] > 0);
-        let died = meta.death_src[def].iter().any(|&s| self.prev_enemy[s] > self.cur_enemy[s]);
+        let tick = view.tick;
+        // Something on the board explains the arrivals only if it is where they
+        // arrived: a Tombstone in the other lane does not hide a Graveyard.
+        let near = |x: f64, y: f64| (x - centre[0]).hypot(y - centre[1]) <= SOURCE_REACH;
+        let makes = &meta.spawn_src[def];
+        let leaves = &meta.death_src[def];
+        let standing = view.ents.iter().any(|e| !e.mine && makes.contains(&e.def) && near(e.x, e.y))
+            || self.gone.iter().any(|g| makes.contains(&g.0) && near(g.1, g.2));
+        let died = self.gone.iter().any(|g| leaves.contains(&g.0) && near(g.1, g.2));
         if standing || died {
             return None;
         }
