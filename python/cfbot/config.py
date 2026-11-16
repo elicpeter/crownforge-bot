@@ -23,6 +23,9 @@ class ModelConfig:
     # Board image at half resolution (16 x 9 cells).
     d_board: int = 96
     board_blocks: int = 2
+    # Depthwise kernel of those blocks (odd). Two 3x3 blocks reach 2 cells each
+    # way, two 7x7 blocks reach 6. The placement block stays 3x3.
+    board_kernel: int = 3
     # Also let the queries attend to the 144 board cells. Costs about a third
     # more compute and memory; unit tokens already carry positions.
     board_in_memory: bool = False
@@ -31,9 +34,14 @@ class ModelConfig:
     # Separate critic network.
     d_critic: int = 128
     critic_hidden: int = 512
-    # Distributional value heads: two-hot targets over this support.
+    # Distributional value heads over this support.
     value_bins: int = 61
     value_range: float = 1.5
+    # "two_hot" splits a target between its two nearest bins. "hl_gauss"
+    # (Farebrother et al. 2024) spreads it over neighbouring bins as a Gaussian
+    # hl_gauss_sigma bin widths wide.
+    value_target: str = "two_hot"
+    hl_gauss_sigma: float = 0.75
     wait_bias: float = 2.0
     # Share of the public-value and auxiliary gradient that reaches the actor
     # encoder. At 1 those losses outweigh the policy loss there several times.

@@ -248,6 +248,40 @@ def test_actor_and_critic_share_no_parameters(model):
     assert actor and critic and not actor & critic
 
 
+def test_shape_knobs_default_to_the_original_network(env):
+    small = MODEL_PRESETS["small"]
+    torch.manual_seed(4)
+    plain = Policy(env.spec, ModelConfig(**small))
+    torch.manual_seed(4)
+    spelled = Policy(env.spec, ModelConfig(**small, board_kernel=3, value_target="two_hot"))
+    assert all(torch.equal(a, b) for a, b in zip(plain.state_dict().values(), spelled.state_dict().values()))
+    returns = torch.tensor([-2.0, -0.33, 0.0, 0.512, 1.5])
+    assert torch.equal(plain.value_target(returns), plain.two_hot(returns))
+
+    wide = Policy(env.spec, ModelConfig(**small, board_kernel=7))
+    assert wide.board_blocks[0].depthwise.weight.shape[-2:] == (7, 7)
+    assert wide.place_block.depthwise.weight.shape[-2:] == (3, 3)
+    obs = env.reset(seed=8)
+    out = wide.act(obs)
+    assert obs["legal"].gather(1, out["flat"][:, None]).bool().all() and torch.isfinite(out["logp"]).all()
+    with pytest.raises(ValueError):
+        Policy(env.spec, ModelConfig(**small, board_kernel=4))
+
+
+def test_hl_gauss_targets_keep_the_mean(env):
+    model = Policy(env.spec, ModelConfig(**MODEL_PRESETS["small"], value_target="hl_gauss"))
+    returns = torch.tensor([-2.0, -1.0, -0.33, 0.0, 0.512, 1.0, 1.5])
+    target = model.value_target(returns)
+    assert torch.allclose(target.sum(-1), torch.ones(len(returns)), atol=1e-5) and (target >= 0).all()
+    # Interior targets keep their mean; a target at the edge of the support is
+    # pulled in by less than one bin.
+    mean = (target * model.support).sum(-1)
+    clamped = returns.clamp(-1.5, 1.5)
+    assert torch.allclose(mean[1:-1], clamped[1:-1], atol=1e-3)
+    assert ((mean - clamped).abs() < 0.05).all()
+    assert ((target > 1e-3).sum(-1) > 2).all() and ((model.two_hot(returns) > 0).sum(-1) <= 2).all()
+
+
 def test_agent_is_reproducible(env, model):
     def run():
         obs = env.reset(seed=21)

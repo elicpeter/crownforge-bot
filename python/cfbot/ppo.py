@@ -125,7 +125,7 @@ def update(
             clipped = ratio.clamp(1 - config.clip, 1 + config.clip)
             policy_loss = -torch.min(ratio * advantage, clipped * advantage).mean()
 
-            target = model.two_hot(mb["return"])
+            target = model.value_target(mb["return"])
             value_loss = -(target * out["value_private"].log_softmax(-1)).sum(-1).mean()
             public_loss = -(target * out["value_public"].log_softmax(-1)).sum(-1).mean()
 
@@ -196,7 +196,7 @@ def update(
             returns = batch["return"][pick[:, 0], pick[:, 1]].to(device)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                 logits = model.critic(mb_obs)
-            loss = -(model.two_hot(returns) * logits.log_softmax(-1)).sum(-1).mean()
+            loss = -(model.value_target(returns) * logits.log_softmax(-1)).sum(-1).mean()
             optimizer.zero_grad(set_to_none=True)
             (config.value_coef * loss).backward()
             norm = torch.nn.utils.clip_grad_norm_(critic_params, config.max_grad_norm)

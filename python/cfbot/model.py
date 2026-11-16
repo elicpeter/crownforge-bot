@@ -117,9 +117,9 @@ class NextBlock(nn.Module):
     from a depthwise convolution and linear layers only, because dense
     convolution gradients are very slow on Apple GPUs."""
 
-    def __init__(self, channels: int, ratio: int = 3):
+    def __init__(self, channels: int, ratio: int = 3, kernel: int = 3):
         super().__init__()
-        self.depthwise = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
+        self.depthwise = nn.Conv2d(channels, channels, kernel, padding=kernel // 2, groups=channels)
         self.norm = nn.LayerNorm(channels)
         self.fc1 = nn.Linear(channels, channels * ratio)
         self.fc2 = nn.Linear(channels * ratio, channels)
@@ -383,6 +383,10 @@ class Critic(nn.Module):
 class Policy(nn.Module):
     def __init__(self, spec: dict, config: ModelConfig):
         super().__init__()
+        if config.board_kernel % 2 != 1:
+            raise ValueError("board_kernel must be odd")
+        if config.value_target not in ("two_hot", "hl_gauss"):
+            raise ValueError("value_target must be 'two_hot' or 'hl_gauss'")
         self.config = config
         d, c, dt = config.d_model, config.d_board, config.d_trunk
         self.embed = Embedder(spec, d, config.d_card, config.fourier_bands)
@@ -398,7 +402,9 @@ class Policy(nn.Module):
         # Units per cell and side, added after the norm, which would otherwise
         # hide how many units share a cell.
         self.board_count = nn.Linear(2, c)
-        self.board_blocks = nn.Sequential(*[NextBlock(c) for _ in range(config.board_blocks)])
+        self.board_blocks = nn.Sequential(
+            *[NextBlock(c, kernel=config.board_kernel) for _ in range(config.board_blocks)]
+        )
         self.board_out = nn.LayerNorm(c)
         self.cell_token = nn.Linear(c, d)
         self.cell_pos = nn.Parameter(torch.randn(BOARD_CELLS, d) * 0.02)
@@ -538,6 +544,23 @@ class Policy(nn.Module):
         out.scatter_(-1, low.unsqueeze(-1), (1 - frac).unsqueeze(-1))
         out.scatter_add_(-1, (low + 1).unsqueeze(-1), frac.unsqueeze(-1))
         return out
+
+    def hl_gauss(self, target: torch.Tensor) -> torch.Tensor:
+        """Gaussian histogram encoding: the mass a normal distribution centred
+        on the target puts in each bin, renormalized over the support."""
+        support = self.support
+        step = support[1] - support[0]
+        target = target.clamp(support[0], support[-1])
+        edges = torch.cat([support - step / 2, support[-1:] + step / 2])
+        sigma = self.config.hl_gauss_sigma * step
+        cdf = torch.erf((edges - target.unsqueeze(-1)) / (math.sqrt(2.0) * sigma))
+        return (cdf[..., 1:] - cdf[..., :-1]) / (cdf[..., -1:] - cdf[..., :1]).clamp(min=1e-6)
+
+    def value_target(self, target: torch.Tensor) -> torch.Tensor:
+        """Scalar returns as a distribution over the value support."""
+        if self.config.value_target == "hl_gauss":
+            return self.hl_gauss(target)
+        return self.two_hot(target)
 
     # ----------------------------------------------------------------- acting
 
