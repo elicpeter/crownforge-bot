@@ -218,6 +218,8 @@ pub struct Rows {
     pub n_reveals: [usize; 2],
     pub n_hazards: [usize; 2],
     pub hazard_overflow: [u32; 2],
+    /// Whether the exported legal mask allows anything besides waiting.
+    pub choice: [bool; 2],
     pub global: Vec<f32>,
     pub entities: Vec<f32>,
     pub entity_extras: Vec<f32>,
@@ -247,6 +249,7 @@ impl Rows {
             n_reveals: [0; 2],
             n_hazards: [0; 2],
             hazard_overflow: [0; 2],
+            choice: [false; 2],
             global: vec![0.0; 2 * GLOBAL_F],
             entities: vec![0.0; 2 * max_entities * ENTITY_F],
             entity_extras: vec![0.0; 2 * max_entities * ENTITY_X_F],
@@ -581,6 +584,7 @@ pub fn featurize(
         legal.fill(0);
         legal[0] = 1;
     }
+    rows.choice[side] = legal[1..].iter().any(|&allowed| allowed != 0);
 
     // ---- privileged: the opponent's hidden state ----
     let enemy: Team = team.opponent();

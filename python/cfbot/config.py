@@ -130,6 +130,22 @@ class TrainConfig:
     amp: bool = True
     # Moving average of the actor's weights, per gradient step. 0 disables.
     ema_decay: float = 0.999
+    # Keep the finished rollout on the training device and gather minibatches
+    # there, instead of gathering on the CPU and uploading every minibatch. It
+    # holds 0.8 GB at entity width 48 and 1.4 GB at 128 for the default
+    # 256 x 128 rollout, and twice that for a moment at the end of collection,
+    # while the steps are stacked. None means on NVIDIA GPUs only: on an Apple
+    # GPU it measured no faster. Results are the same either way; turn it off
+    # if GPU memory is short.
+    rollout_on_device: bool | None = None
+    # AdamW as one fused kernel per tensor on CUDA and Apple GPUs. Same update
+    # rule; last-digit differences from the default implementation.
+    fused_optimizer: bool = True
+    # Run the two training forward passes through torch.compile. Meant for
+    # NVIDIA GPUs and not yet run on one; off until it has been. A pass whose
+    # forward fails to compile runs uncompiled; try it on a short run first.
+    compile: bool = False
+    compile_backend: str = "inductor"
 
     # Shaped reward, zero-sum between the two players, annealed to zero over
     # the first shaping_anneal_frac of the run so the final objective is
@@ -194,6 +210,35 @@ class TrainConfig:
             if data.get(key) is not None:
                 data[key] = tuple(data[key])
         return TrainConfig(model=model, **data)
+
+
+def override(config: TrainConfig, item: str) -> None:
+    """Apply one ``key=value`` setting from the command line. Values are read
+    as JSON (``true``, ``null``, ``0.5``, ``"cpu"``, ``[1, 2]``); a bare word
+    is taken as a string where the field holds one. ``True``, ``False`` and
+    ``None`` are accepted for switches, so a Python spelling cannot turn into
+    a non-empty string that counts as true."""
+    key, _, text = item.partition("=")
+    target = config
+    if key.startswith("model."):
+        target, key = config.model, key[len("model."):]
+    kinds = {f.name: str(f.type) for f in dataclasses.fields(target)}
+    if key not in kinds:
+        raise SystemExit(f"unknown config key: {item}")
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        value = text
+    kind = kinds[key]
+    if isinstance(value, str) and "str" not in kind:
+        word = value.strip().lower()
+        if word in ("true", "false") and "bool" in kind:
+            value = word == "true"
+        elif word in ("none", "null") and "None" in kind:
+            value = None
+        else:
+            raise SystemExit(f"cannot read {text!r} as {kind} for {key}")
+    setattr(target, key, value)
 
 
 def pick_device(name: str = "auto"):

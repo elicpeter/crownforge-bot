@@ -58,6 +58,55 @@ def mlp(inp: int, hidden: int, out: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(inp, hidden), nn.GELU(), nn.Linear(hidden, out))
 
 
+class _LookupWithProductGradient(torch.autograd.Function):
+    """An embedding lookup whose gradient is ``one_hot(ids).T @ grad``: the
+    sum of the incoming gradient over the tokens that read each row, padding
+    row included. The one-hot exists only inside the backward call."""
+
+    @staticmethod
+    def forward(ctx, weight, ids):
+        ctx.save_for_backward(ids)
+        ctx.rows = weight.shape[0]
+        return F.embedding(ids, weight)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (ids,) = ctx.saved_tensors
+        columns = torch.arange(ctx.rows, device=ids.device)
+        hot = (ids.reshape(-1, 1) == columns).to(grad.dtype)
+        return hot.t() @ grad.reshape(-1, grad.shape[-1]), None
+
+
+class Embedding(nn.Embedding):
+    """An embedding table that, on Apple GPUs, takes its gradient through a
+    matrix product.
+
+    The lookup's own gradient is a scatter into the table, which that backend
+    runs very slowly: about a quarter of the backward pass of this network.
+    The same sums come out of multiplying a one-hot matrix by the incoming
+    gradient, which is fast. The forward pass is the plain lookup everywhere,
+    and so is the gradient on every other device.
+
+    One thing is carried over on purpose. On Apple GPUs PyTorch (2.9) sends
+    gradient to the ``padding_idx`` row as well, which it should not and does
+    not on other devices. The product does the same, so that training on this
+    device is what it was before. See the README on what that means for a run
+    moved between devices.
+    """
+
+    matmul_devices = ("mps",)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        weight = self.weight
+        if (
+            weight.device.type in self.matmul_devices
+            and weight.requires_grad
+            and torch.is_grad_enabled()
+        ):
+            return _LookupWithProductGradient.apply(weight, ids)
+        return super().forward(ids)
+
+
 class Attention(nn.Module):
     """Multi-head attention from queries to a masked memory."""
 
@@ -77,6 +126,43 @@ class Attention(nn.Module):
         attn_mask = None if mask is None else mask[:, None, None, :]
         out = F.scaled_dot_product_attention(qs, k, v, attn_mask=attn_mask)
         return self.proj(out.transpose(1, 2).reshape(n, q, d))
+
+    def read(self, queries, memory, mask):
+        """``forward`` for a few queries over a long memory, computed from the
+        query side.
+
+        ``forward`` turns every memory token into a key and a value (a
+        ``dim -> 2 dim`` layer over the whole memory) to serve a handful of
+        queries. The same numbers come out if the key weights are applied to
+        the queries instead, the attention weights average the raw memory, and
+        the value weights are applied to that average:
+
+            q . (Wk m + bk)        = (Wk' q) . m + q . bk
+            sum_s a_s (Wv m_s + bv) = Wv (sum_s a_s m_s) + bv      (sum_s a_s = 1)
+
+        ``q . bk`` is the same for every memory token of a query, and softmax
+        ignores a constant, so it is left out; the key bias never had an
+        effect on the output. Per row this costs about ``2 heads Q dim S``
+        multiply-adds instead of ``2 dim^2 S``: for 7 queries with 6 heads,
+        a fifth of the work. The weights and their shapes are untouched.
+        Needs at least one unmasked token per row; the eight deck tokens
+        always are.
+        """
+        n, q, d = queries.shape
+        h = self.heads
+        head = d // h
+        key = self.kv.weight[:d].view(h, head, d)
+        value = self.kv.weight[d:].view(h, head, d)
+        value_bias = self.kv.bias[d:].view(h, 1, head)
+        qs = self.q(queries).view(n, q, h, head).permute(2, 0, 1, 3).reshape(h, n * q, head)
+        # Queries in memory space, one per (head, query): [n, h * q, d].
+        qk = torch.bmm(qs, key).view(h, n, q, d).permute(1, 0, 2, 3).reshape(n, h * q, d)
+        scores = torch.bmm(qk, memory.transpose(1, 2)) * (1.0 / math.sqrt(head))
+        scores = scores.masked_fill(~mask[:, None, :], float("-inf"))
+        context = torch.bmm(scores.softmax(-1).to(memory.dtype), memory)
+        context = context.view(n, h, q, d).permute(1, 0, 2, 3).reshape(h, n * q, d)
+        out = torch.bmm(context, value.transpose(1, 2)) + value_bias
+        return self.proj(out.view(h, n, q, head).permute(1, 2, 0, 3).reshape(n, q, d))
 
 
 class SelfBlock(nn.Module):
@@ -106,7 +192,7 @@ class QueryBlock(nn.Module):
         self.mlp = mlp(dim, dim * ratio, dim)
 
     def forward(self, queries, memory, mask):
-        queries = queries + self.cross(self.norm_q(queries), memory, mask)
+        queries = queries + self.cross.read(self.norm_q(queries), memory, mask)
         y = self.norm_s(queries)
         queries = queries + self.self_attn(y, y)
         return queries + self.mlp(self.norm_m(queries))
@@ -151,14 +237,14 @@ class Embedder(nn.Module):
 
         self.register_buffer("card_table", torch.as_tensor(spec["card_table"]).float().clone())
         self.register_buffer("unit_table", torch.as_tensor(spec["unit_table"]).float().clone())
-        self.card_emb = nn.Embedding(spec["n_cards"], d_card, padding_idx=0)
+        self.card_emb = Embedding(spec["n_cards"], d_card, padding_idx=0)
         self.card_stats = nn.Linear(spec["card_f"], d_card)
-        self.unit_emb = nn.Embedding(spec["n_units"], dim, padding_idx=0)
+        self.unit_emb = Embedding(spec["n_units"], dim, padding_idx=0)
         self.unit_stats = nn.Linear(spec["unit_f"], dim)
-        self.kind_emb = nn.Embedding(5, dim, padding_idx=0)
-        self.tower_emb = nn.Embedding(5, dim, padding_idx=0)
-        self.side_emb = nn.Embedding(2, dim)
-        self.hazard_emb = nn.Embedding(spec["n_hazards"], dim, padding_idx=0)
+        self.kind_emb = Embedding(5, dim, padding_idx=0)
+        self.tower_emb = Embedding(5, dim, padding_idx=0)
+        self.side_emb = Embedding(2, dim)
+        self.hazard_emb = Embedding(spec["n_hazards"], dim, padding_idx=0)
         self.play_rank = nn.Parameter(torch.randn(spec["play_rows"], dim) * 0.02)
         self.type_emb = nn.Parameter(torch.randn(6, dim) * 0.02)
         self.slot_emb = nn.Parameter(torch.randn(4, dim) * 0.02)
@@ -457,7 +543,9 @@ class Policy(nn.Module):
         row = (xy[..., 1] * BOARD_H).long().clamp(0, BOARD_H - 1)
         return row * BOARD_W + col
 
-    def encode(self, obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def encode(self, obs: dict[str, torch.Tensor], heads: bool = True) -> dict[str, torch.Tensor]:
+        """Shared encoder. ``heads=False`` leaves out the trunk of the public
+        value and auxiliary heads, which acting does not read."""
         tok = self.embed(obs)
         entities, entity_mask = tok["entity"], tok["entity_mask"]
         for block in self.entity_blocks:
@@ -498,16 +586,19 @@ class Policy(nn.Module):
             queries = block(queries, memory, mask)
         queries = self.query_norm(queries)
         glob, hand, abil = queries[:, 0], queries[:, 1:5], queries[:, 5:7]
-        summary = torch.cat([glob, hand.mean(1), board.mean((1, 2)), board.amax((1, 2))], dim=-1)
-        # The public value and auxiliary heads read the trunk. Scale the gradient
-        # they send back so they inform the encoder without steering it.
-        scale = self.config.aux_grad_scale
-        trunk = self.trunk(summary.detach() + scale * (summary - summary.detach()))
         # Candidates: wait, four primary plays, four secondary plays, two abilities.
         cand = torch.cat(
             [glob.unsqueeze(1), hand + self.option_emb[0], hand + self.option_emb[1], abil], dim=1
         )
-        return {"glob": glob, "cand": cand, "board": board, "trunk": trunk}
+        out = {"glob": glob, "cand": cand, "board": board}
+        if heads:
+            summary = torch.cat([glob, hand.mean(1), board.mean((1, 2)), board.amax((1, 2))], dim=-1)
+            # The public value and auxiliary heads read the trunk. Scale the
+            # gradient they send back so they inform the encoder without
+            # steering it.
+            scale = self.config.aux_grad_scale
+            out["trunk"] = self.trunk(summary.detach() + scale * (summary - summary.detach()))
+        return out
 
     # ------------------------------------------------------------------ heads
 
@@ -572,21 +663,28 @@ class Policy(nn.Module):
         generator: torch.Generator | None = None,
         temperature: float = 1.0,
         with_value: bool = True,
+        noise: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Choose one action per row.
 
         ``deterministic`` takes the most likely type and cell. A ``generator``
         makes sampling reproducible: noise is drawn on the CPU from it.
+        ``noise`` supplies the uniform draws instead, ``[N, 11]`` for the type
+        and ``[N, 576]`` for the cell, so a caller that runs only some rows can
+        keep the random stream of running all of them.
         ``with_value`` also runs the critic, which needs the ``priv_*`` planes.
         """
-        enc = self.encode(obs)
+        enc = self.encode(obs, heads=False)
         type_mask, cell_mask = A.split_legal(obs["legal"])
         rows = torch.arange(type_mask.shape[0], device=type_mask.device)
+        supplied = list(noise) if noise is not None else None
 
         def pick(logits):
             if deterministic:
                 return logits.argmax(-1)
-            if generator is not None:
+            if supplied is not None:
+                uniform = supplied.pop(0)
+            elif generator is not None:
                 uniform = torch.rand(logits.shape, generator=generator).to(logits.device)
             else:
                 uniform = torch.rand(logits.shape, device=logits.device)
@@ -649,28 +747,59 @@ class Policy(nn.Module):
     # --------------------------------------------------------------- training
 
     def evaluate(
-        self, obs: dict[str, torch.Tensor], action_type: torch.Tensor, cell: torch.Tensor
+        self,
+        obs: dict[str, torch.Tensor],
+        action_type: torch.Tensor,
+        cell: torch.Tensor,
+        plays: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Score stored actions for a flat batch of decisions."""
+        """Score stored actions for a flat batch of decisions.
+
+        Only a play has a cell, so only play rows need the placement head; a
+        wait or an ability contributes exactly zero to the cell terms and to
+        their gradient. ``plays`` names those rows so the head runs on them
+        alone: ``(index, weight)``, row numbers and a weight of one each, which
+        the caller may pad to a fixed length with any row at weight zero.
+        Without it the head runs on every row and the rest is discarded.
+        """
         enc = self.encode(obs)
         type_mask, cell_mask = A.split_legal(obs["legal"])
         rows = torch.arange(type_mask.shape[0], device=type_mask.device)
 
         type_logp = self._type_logits(enc, type_mask).log_softmax(-1)
         type_entropy = -(type_logp.exp() * type_logp).sum(-1)
-        is_play = (action_type >= 1) & (action_type <= A.PLAY_TYPES)
-        play_index = (action_type - 1).clamp(0, A.PLAY_TYPES - 1)
-        mask = cell_mask[rows, play_index] | ~is_play.unsqueeze(-1)
-        cell_logp = self._cell_logits(
-            enc["glob"], enc["cand"][rows, action_type], enc["board"], mask
-        ).log_softmax(-1)
-        cell_entropy = -(cell_logp.exp() * cell_logp).sum(-1)
         zero = torch.zeros_like(type_entropy)
+        if plays is None:
+            is_play = (action_type >= 1) & (action_type <= A.PLAY_TYPES)
+            play_index = (action_type - 1).clamp(0, A.PLAY_TYPES - 1)
+            mask = cell_mask[rows, play_index] | ~is_play.unsqueeze(-1)
+            cell_logp = self._cell_logits(
+                enc["glob"], enc["cand"][rows, action_type], enc["board"], mask
+            ).log_softmax(-1)
+            cell_entropy = -(cell_logp.exp() * cell_logp).sum(-1)
+            cell_term = torch.where(is_play, cell_logp[rows, cell], zero)
+            cell_entropy = torch.where(is_play, cell_entropy, zero)
+        else:
+            index, weight = plays
+            kind = action_type.index_select(0, index)
+            is_play = (kind >= 1) & (kind <= A.PLAY_TYPES)
+            play_index = (kind - 1).clamp(0, A.PLAY_TYPES - 1)
+            some = torch.arange(index.shape[0], device=index.device)
+            mask = cell_mask.index_select(0, index)[some, play_index] | ~is_play.unsqueeze(-1)
+            cell_logp = self._cell_logits(
+                enc["glob"].index_select(0, index), enc["cand"][index, kind],
+                enc["board"].index_select(0, index), mask,
+            ).log_softmax(-1)
+            weight = weight * is_play
+            picked = cell_logp[some, cell.index_select(0, index)] * weight
+            entropy = -(cell_logp.exp() * cell_logp).sum(-1) * weight
+            cell_term = zero.index_add(0, index, picked)
+            cell_entropy = zero.index_add(0, index, entropy)
         trunk = enc["trunk"]
         return {
-            "logp": type_logp[rows, action_type] + torch.where(is_play, cell_logp[rows, cell], zero),
+            "logp": type_logp[rows, action_type] + cell_term,
             "type_entropy": type_entropy,
-            "cell_entropy": torch.where(is_play, cell_entropy, zero),
+            "cell_entropy": cell_entropy,
             "value_public": self.value_public(trunk).float(),
             "value_private": self.critic(obs),
             "aux_hand": self.aux_hand(trunk).float(),

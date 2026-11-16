@@ -21,21 +21,14 @@ import time
 import numpy as np
 import torch
 
-from .config import MODEL_PRESETS, ModelConfig, TrainConfig, pick_device
+from .config import MODEL_PRESETS, ModelConfig, TrainConfig, override, pick_device
 from .decks import DeckStats, resolve_pool
 from .env import Env
 from .evaluate import run_gauntlet
 from .league import League, rules_label
 from .model import Policy, count_parameters
-from .ppo import Ema, make_optimizer, schedule, update
+from .ppo import Ema, Passes, load_optimizer, make_optimizer, schedule, update
 from .rollout import Collector
-
-
-def parse_value(text: str):
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return text
 
 
 def build_config(args) -> TrainConfig:
@@ -46,13 +39,7 @@ def build_config(args) -> TrainConfig:
     else:
         config = TrainConfig(run_dir=args.run, model=ModelConfig(**MODEL_PRESETS[args.preset]))
     for item in args.set or []:
-        key, _, value = item.partition("=")
-        target = config
-        if key.startswith("model."):
-            target, key = config.model, key[len("model."):]
-        if not hasattr(target, key):
-            raise SystemExit(f"unknown config key: {item}")
-        setattr(target, key, parse_value(value))
+        override(config, item)
     config.run_dir = args.run
     return config
 
@@ -134,7 +121,11 @@ def main() -> None:
     checkpoint_path = os.path.join(config.run_dir, "checkpoint.pt")
     data = None
     if args.resume and os.path.exists(checkpoint_path):
-        data = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        # Load to the CPU: the model, optimizer and averaged weights each move
+        # their tensors where they belong. Mapping straight to the device would
+        # also move the optimizer's step counters there, and AdamW then waits
+        # for the GPU once per parameter tensor in every gradient step.
+        data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state = {"iteration": 0, "samples": 0, "elapsed": 0.0, "next_gauntlet": 0.0}
     if data is not None:
         state.update({key: data[key] for key in state if key in data})
@@ -168,7 +159,7 @@ def main() -> None:
         if trained_on and trained_on != rules_label(spec):
             print(f"warning: checkpoint was trained on {trained_on}, now running {rules_label(spec)}")
         model.load_state_dict(data["model"])
-        optimizer.load_state_dict(data["optimizer"])
+        load_optimizer(optimizer, data["optimizer"])
         league.load_state_dict(data["league"])
         if ema is not None and data.get("ema"):
             ema.load_state_dict(data["ema"])
@@ -179,6 +170,7 @@ def main() -> None:
         handle.write(config.to_json())
 
     collector = Collector(config, env, model, league, deck_stats, seed=config.seed + iteration)
+    passes = Passes(model, config)
     rng = np.random.default_rng(config.seed + iteration)
     limit = f"{config.budget_hours} h budget" if config.budget_hours else f"{config.total_iters} iterations"
     print(
@@ -220,11 +212,15 @@ def main() -> None:
 
         batch, stats = collector.collect(iteration, shaping)
         collected = time.time()
-        metrics = update(model, optimizer, batch, config, entropy_coef, device, rng, ema)
+        metrics = update(model, optimizer, batch, config, entropy_coef, device, rng, ema, passes)
         finished = time.time()
 
         iteration += 1
         learner_samples = int(batch["train"].sum())
+        value_mean = float(batch["value"][batch["train"]].mean())
+        # Let go of the rollout now, so the next one is not collected next to
+        # it: it is about a gigabyte, on the GPU when it is kept there.
+        del batch
         state["iteration"] = iteration
         state["samples"] += learner_samples
         if iteration % config.snapshot_iters == 0 or iteration == 1:
@@ -259,7 +255,7 @@ def main() -> None:
             "shaping": shaping,
             "pool_prob": pool_prob,
             "mutant_prob": mutant_prob,
-            "value_mean": float(batch["value"][batch["train"]].mean()),
+            "value_mean": value_mean,
             **{key: round(value, 5) for key, value in metrics.items()},
             **{key: round(value, 3) for key, value in stats.items()},
             **league.summary(),

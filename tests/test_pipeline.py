@@ -11,7 +11,7 @@ import torch
 
 from cfbot import actions as A
 from cfbot.agent import Agent
-from cfbot.config import DRAFT_CARDS, MODEL_PRESETS, ModelConfig, TrainConfig
+from cfbot.config import DRAFT_CARDS, MODEL_PRESETS, ModelConfig, TrainConfig, override
 from cfbot.decks import ARCHETYPES, DeckStats, resolve_pool
 from cfbot.env import POLICY_KEYS, PRIVATE_KEYS, Env, card_ids, observed_towers
 from cfbot.evaluate import fit_ratings, play_paired
@@ -417,6 +417,30 @@ def test_league_survives_a_moved_run_and_thins_snapshots(tmp_path, env):
     assert len(resumed.snapshots) == len(league.snapshots)
     resumed.add_snapshot(model, 99_999)
     assert resumed.snapshots[-1]["id"] == league.next_id  # never reuses a file name
+
+
+def test_settings_from_the_command_line_keep_their_type():
+    config = TrainConfig()
+    for item, key, expected in (
+        ("compile=true", "compile", True), ("compile=False", "compile", False),
+        ("rollout_on_device=False", "rollout_on_device", False),
+        ("rollout_on_device=None", "rollout_on_device", None),
+        ("rollout_on_device=null", "rollout_on_device", None),
+        ("fused_optimizer=false", "fused_optimizer", False),
+        ("budget_hours=330", "budget_hours", 330), ("budget_hours=None", "budget_hours", None),
+        ('device="cpu"', "device", "cpu"), ("device=mps", "device", "mps"),
+        ("fixed_opponent=runs/main/checkpoint.pt", "fixed_opponent", "runs/main/checkpoint.pt"),
+        ("num_envs=8", "num_envs", 8), ("level_jitter=[-1, 2]", "level_jitter", [-1, 2]),
+    ):
+        override(config, item)
+        assert getattr(config, key) == expected and type(getattr(config, key)) is type(expected), item
+    override(config, "model.value_target=hl_gauss")
+    assert config.model.value_target == "hl_gauss"
+    # A word that is not a value of the field is refused, not stored as a
+    # string that every `if` would take for true.
+    for item in ("compile=off", "num_envs=many", "rollout_on_device=cpu", "no_such_key=1"):
+        with pytest.raises(SystemExit):
+            override(config, item)
 
 
 def test_train_command_runs_resumes_and_rates(tmp_path):

@@ -939,8 +939,15 @@ impl VecEnv {
         let mut entity_mask = Vec::with_capacity(rows * width);
         let mut overflow = Vec::with_capacity(rows);
         let mut hazard_overflow = Vec::with_capacity(rows);
+        // Two summaries of the row the trainer would otherwise recompute from
+        // the planes every step: how many entity rows are valid, and whether
+        // the exported legal mask allows anything besides waiting.
+        let mut entity_count = Vec::with_capacity(rows);
+        let mut choice = Vec::with_capacity(rows);
         for slot in &self.slots {
             for side in 0..2 {
+                entity_count.push(slot.rows.n_entities[side].min(width) as i64);
+                choice.push(slot.rows.choice[side]);
                 entities.extend_from_slice(
                     &slot.rows.entities[side * cap * ENTITY_F..][..width * ENTITY_F],
                 );
@@ -969,6 +976,8 @@ impl VecEnv {
             entity_mask.into_pyarray(py).reshape([rows, width])?,
         )?;
         d.set_item("entity_overflow", overflow.into_pyarray(py))?;
+        d.set_item("entity_count", entity_count.into_pyarray(py))?;
+        d.set_item("choice", choice.into_pyarray(py))?;
 
         macro_rules! gather {
             ($name:literal, $field:ident, $shape:expr) => {{

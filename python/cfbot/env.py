@@ -16,6 +16,8 @@ POLICY_KEYS = (
 # Hidden opponent state for the training-only critic.
 PRIVATE_KEYS = ("priv_global", "priv_hand", "priv_deck")
 OBS_KEYS = POLICY_KEYS + PRIVATE_KEYS
+# What the critic reads: everything but the legal-action mask.
+CRITIC_KEYS = tuple(key for key in OBS_KEYS if key != "legal")
 # Keys whose second axis is the per-step entity width and must be padded
 # when steps are stacked.
 ENTITY_KEYS = ("entities", "entity_extras", "entity_mask")
@@ -80,7 +82,44 @@ class Env:
         # `last_cpu` shares memory with the fresh numpy arrays of this step, so
         # rollout storage can keep it without another copy.
         self.last_cpu = {key: torch.from_numpy(raw[key]) for key in OBS_KEYS}
-        return {key: value.to(self.device) for key, value in self.last_cpu.items()}
+        # Per row: whether anything but waiting is legal, and how many entity
+        # rows are valid. Both follow from the planes; the bridge has them for
+        # free.
+        if "choice" in raw:
+            self.last_choice = torch.from_numpy(raw["choice"])
+            self.last_entity_count = torch.from_numpy(raw["entity_count"])
+        else:  # a bridge built before it exported them
+            self.last_choice = self.last_cpu["legal"][:, 1:].bool().any(-1)
+            self.last_entity_count = self.last_cpu["entity_mask"].sum(-1)
+        return self.upload(self.last_cpu, packed=True)
+
+    def upload(self, obs: dict[str, torch.Tensor], packed: bool = False) -> dict[str, torch.Tensor]:
+        """Copy CPU planes to the device.
+
+        ``packed`` sends them as two blocks, one per dtype, and returns views
+        into those: a transfer costs about the same whatever its size, and one
+        step's observation is twenty small planes. The views are fine to
+        gather rows from; a caller that will reshape whole planes should ask
+        for separate copies. On CUDA the copies are queued without waiting for
+        each one; the first use waits for them."""
+        device = self.device
+        if device.type == "cpu":
+            return dict(obs)
+        lazy = device.type == "cuda"
+        if not packed:
+            return {key: value.to(device, non_blocking=lazy) for key, value in obs.items()}
+        out = {}
+        lead = next(iter(obs.values())).shape[0]
+        for dtype in {value.dtype for value in obs.values()}:
+            keys = [key for key, value in obs.items() if value.dtype == dtype]
+            block = torch.cat([obs[key].reshape(lead, -1) for key in keys], dim=1)
+            block = block.to(device, non_blocking=lazy)
+            start = 0
+            for key in keys:
+                size = obs[key][0].numel()
+                out[key] = block[:, start : start + size].view(obs[key].shape)
+                start += size
+        return out
 
     def reset(self, seed: int | None = None) -> dict[str, torch.Tensor]:
         return self._obs(self.env.reset(seed))
@@ -118,11 +157,38 @@ def select_rows(obs: dict[str, torch.Tensor], rows: torch.Tensor) -> dict[str, t
     return {key: value[rows] for key, value in obs.items()}
 
 
+def entity_width(longest: int, limit: int) -> int:
+    """Entity columns needed for rows of up to ``longest`` entities: the next
+    multiple of 16, at most ``limit``."""
+    return min(limit, max(16, -(-longest // 16) * 16))
+
+
+def gather_rows(
+    obs: dict[str, torch.Tensor], counts: torch.Tensor, pick: torch.Tensor, keys, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """Rows ``pick`` of a stored rollout, on ``device``, with the entity axis
+    cut to the longest of those rows in steps of 16.
+
+    ``obs`` holds the rollout flattened to one row per decision, on the CPU or
+    already on the device. ``counts`` holds every row's entity count on the
+    CPU, so finding the width never waits for the device."""
+    home = obs["entity_mask"].device
+    width = entity_width(int(counts[pick].max()), obs["entity_mask"].shape[1])
+    where = pick.to(home)
+    rows = {}
+    for key in keys:
+        value = obs[key]
+        if key in ENTITY_KEYS:
+            value = value[:, :width]
+        rows[key] = value.index_select(0, where).to(device)
+    return rows
+
+
 def trim_entities(obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Cut the entity axis to the longest row present, in steps of 16."""
     mask = obs["entity_mask"]
     longest = int(mask.sum(-1).max()) if mask.numel() else 0
-    width = min(mask.shape[-1], max(16, -(-longest // 16) * 16))
+    width = entity_width(longest, mask.shape[-1])
     if width == mask.shape[-1]:
         return obs
     out = dict(obs)
