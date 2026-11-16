@@ -31,7 +31,7 @@ maturin develop --release
 if ($LASTEXITCODE) { Pop-Location; throw "building cr_sim failed" }
 Pop-Location
 # cfbot is plain Python on this simulator: if it is not installed, put python\ on the path.
-python -c "import cfbot" 2>$null
+python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('cfbot') else 1)"
 if ($LASTEXITCODE) {
     python -c "import os, sysconfig; p = os.path.join(sysconfig.get_paths()['purelib'], 'cfbot-src.pth'); open(p, 'w').write(os.path.abspath('python') + '\n'); print('wrote', p)"
 }

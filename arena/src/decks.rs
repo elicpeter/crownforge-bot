@@ -128,17 +128,20 @@ impl DeckSampler {
             && (21..=37).contains(&cost)
     }
 
-    pub fn sample(&self, rng: &mut Rng) -> [Deck; 2] {
+    /// Decks for the two seats, and the seat that was given a focus deck, if any.
+    pub fn sample(&self, rng: &mut Rng) -> ([Deck; 2], Option<usize>) {
         let first = self.sample_one(rng);
         let mut decks = [first, if self.mirror { first } else { self.sample_one(rng) }];
+        let mut focus = None;
         if !self.focus.is_empty() && rng.unit() < self.focus_prob {
             let seat = rng.below(2);
             decks[seat] = self.focus[rng.below(self.focus.len())];
             if self.mirror {
                 decks[1 - seat] = decks[seat];
             }
+            focus = Some(seat);
         }
-        decks
+        (decks, focus)
     }
 
     fn pool_deck(&self, rng: &mut Rng) -> Deck {

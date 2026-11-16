@@ -239,6 +239,14 @@ def main() -> None:
             gauntlet = run_gauntlet(model, league, config, device, iteration)
             state["next_gauntlet"] = progress + config.gauntlet_frac
 
+        # A file named STOP in the run folder ends the run as Ctrl-C does, for
+        # a process that cannot be signalled (a detached one on Windows). The
+        # file is removed, so the run can be resumed without touching it.
+        stop_file = os.path.join(config.run_dir, "STOP")
+        if os.path.exists(stop_file):
+            os.remove(stop_file)
+            request_stop()
+
         # Evaluation time counts against the budget too.
         state["elapsed"] += time.time() - started
         progress = run_progress(config, iteration, state["elapsed"])

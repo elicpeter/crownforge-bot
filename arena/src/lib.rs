@@ -104,6 +104,8 @@ struct Slot {
     rows: [Rows; 2],
     queue: VecDeque<QueuedMatch>,
     queued: bool,
+    /// The seat holding a focus deck in the running episode, or -1.
+    focus_seat: i8,
     decisions: u32,
     /// Troop health after the previous decision, by entity id: remaining
     /// health, elixir value per health point, owner.
@@ -140,6 +142,7 @@ impl Slot {
             rows: [Rows::new(max_entities), Rows::new(max_entities)],
             queue: VecDeque::new(),
             queued: false,
+            focus_seat: -1,
             decisions: 0,
             health: HashMap::new(),
             health_next: HashMap::new(),
@@ -174,13 +177,18 @@ impl Slot {
         self.episode += 1;
         self.queued = false;
         let mut rng = Rng(seed);
+        self.focus_seat = -1;
         self.decks = match self.queue.pop_front() {
             Some(request) => {
                 seed = request.seed.unwrap_or(seed);
                 self.queued = true;
                 request.decks
             }
-            None => context.sampler.sample(&mut rng),
+            None => {
+                let (decks, focus) = context.sampler.sample(&mut rng);
+                self.focus_seat = focus.map_or(-1, |seat| seat as i8);
+                decks
+            }
         };
         self.eng.reset(seed, Some([self.decks[0].to_vec(), self.decks[1].to_vec()]));
         self.decisions = 0;
@@ -623,7 +631,9 @@ impl VecEnv {
     }
 
     /// Decks one seat (chosen at random) of a new battle plays with chance
-    /// `prob`, whatever the sampler gives the other seat.
+    /// `prob`, whatever the sampler gives the other seat. Every observation
+    /// carries `focus_seat`: per battle, the seat holding a focus deck in the
+    /// running episode, or -1. A trainer that controls one seat takes that one.
     fn set_focus(&mut self, decks: Vec<Vec<usize>>, prob: f64) -> PyResult<()> {
         let focus = pool_from_tokens(&self.context.sampler, &decks)?;
         self.context.sampler.set_focus(focus, prob);
@@ -795,6 +805,8 @@ impl VecEnv {
 impl VecEnv {
     fn write_observation<'py>(&self, py: Python<'py>, d: &Bound<'py, PyDict>) -> PyResult<()> {
         let all: Vec<&Rows> = self.slots.iter().flat_map(|slot| slot.rows.iter()).collect();
+        let focus: Vec<i8> = self.slots.iter().map(|slot| slot.focus_seat).collect();
+        d.set_item("focus_seat", focus.into_pyarray(py))?;
         write_rows(py, d, &all, true)
     }
 }

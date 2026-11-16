@@ -436,7 +436,7 @@ and the stock simulator next to it, with
 in an environment that already has PyTorch. It needs git and a Rust toolchain
 (and on Windows the Visual Studio C++ build tools). `ARENA_REV` selects the
 commit; use the one the tournament server runs, since a later commit may play
-differently. The Windows script has not been run. On a machine without a
+differently. On a machine without a
 Crownforge checkout the root package cannot be built; the script then puts
 `python/` on the environment's path instead, which is all this simulator needs.
 
@@ -510,8 +510,9 @@ A tournament entry plays one deck. Two tools for that:
 
 - `focus_decks` and `focus_prob` give one seat of a battle one of the listed
   decks with that chance, whatever the other seat draws: more practice with
-  the candidate decks against the usual spread of opponents. Both can be set
-  when a run is resumed.
+  the candidate decks against the usual spread of opponents. In a league
+  battle the learner sits on that seat, so the practice goes to the network
+  that is learning. Both can be set when a run is resumed.
 - `python scripts/arena_pick_deck.py CHECKPOINT` plays the checkpoint on every
   candidate deck against one fixed list of opposing decks, and against the
   arena's example client on its own deck, and prints the table.
@@ -544,6 +545,35 @@ against the arena's example client, which had beaten an untrained network 3 to
 checkpoint in the gauntlet (0.08) than the real client did (0.35): the client
 plays an all-troop deck, the gauntlet's decks hold spells it wastes. Check
 against the real client before entering.
+
+On an RTX 5070 Ti with a Ryzen 7 9800X3D (Windows 11, PyTorch 2.11, CUDA
+12.8) the limit is different. The gradient step is cheap there and collecting
+is not: each step of the batch makes four network calls (the learner and three
+league opponents), and their fixed cost outweighs the arithmetic until the
+batch is large. Measured decisions a second, two to three minutes each:
+
+| preset | battles x steps | decisions/s | GPU memory |
+|---|---|---|---|
+| base | 256 x 128 (default) | 6,900 | 5.5 GB |
+| base | 512 x 128 | 9,880 | 6.1 GB |
+| base | 1024 x 128 | 11,970 | 7.6 GB |
+| large | 256 x 128 | 5,600 | 9.2 GB |
+| large | 512 x 128 | 7,640 | 10.2 GB |
+| large | 1024 x 64 | 8,690 | 10.7 GB |
+| large | 1536 x 64 | 9,310 | 12.1 GB |
+| large | 2048 x 64 | 9,450 | 13.0 GB |
+| large | 1536 x 64, `minibatch=1024` | 9,330 | 7.7 GB |
+
+So more battles and shorter rollouts buy speed, and the large preset costs a
+quarter of the throughput there, against two thirds on the M2 Max. Memory in
+the gradient step grows with the widest board of the minibatch, about 1.1 GB
+for the large preset for every 16 more units at `minibatch=2048`; a 16 GB card
+is safe at 1024. `compile=true` does nothing on Windows: PyTorch's compiler
+needs Triton there, the forward passes fall back, and the run was slower.
+
+A detached run on Windows cannot be sent Ctrl-C. A file named `STOP` in the run
+folder does the same: the run checkpoints after the iteration and exits, and
+removes the file.
 
 To try a checkpoint before entering, run the arena's own server locally and
 connect the client and the arena's example client to it:

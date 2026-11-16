@@ -72,6 +72,10 @@ class Collector:
         self.flip_rng = torch.Generator().manual_seed(seed + 11)
         self.opponent = np.zeros(env.num_envs, dtype=np.int64)
         self.learner_side = self.rng.integers(2, size=env.num_envs)
+        focus = getattr(env, "focus_seat", None)
+        if focus is not None:
+            # Arena only: a battle that holds a focus deck has the learner on that seat.
+            self.learner_side = np.where(focus >= 0, focus, self.learner_side).astype(np.int64)
         # Games whose opponent changed mid-game do not count for ratings.
         self.tainted = np.zeros(env.num_envs, dtype=bool)
         self.relayout(0.0)
@@ -279,6 +283,11 @@ class Collector:
                     # says something about the decks.
                     self.deck_stats.record(info["decks"][index], float(info["reward"][index * 2]))
                 self.learner_side[index] = self.rng.integers(2)
+                # The episode that has just started may hold a focus deck on one
+                # seat (arena only): the learner takes that seat.
+                focus = getattr(self.env, "focus_seat", None)
+                if focus is not None and focus[index] >= 0:
+                    self.learner_side[index] = int(focus[index])
                 self.tainted[index] = False
 
         obs = self._stack(obs_steps)

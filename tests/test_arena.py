@@ -133,11 +133,44 @@ def test_focus_decks_reach_one_seat():
     env = cfbot_arena.VecEnv(num_envs=64, workers=2, seed=9)
     spec = env.spec()
     focus = tokens(spec, ARENA_ARCHETYPES["guide_example"])
+    obs = env.reset(9)
+    assert (obs["focus_seat"] == -1).all()
     env.set_focus([focus], 1.0)
     obs = env.reset(9)
     decks = obs["own_deck"][:, :, 0].astype(int).reshape(64, 2, 8)
     holds = (np.sort(decks, -1) == np.sort(focus)).all(-1)
     assert holds.any(-1).all() and 20 < holds[:, 0].sum() < 44
+    # The bridge names the seat, also for episodes that start inside a step.
+    rng = np.random.default_rng(9)
+    finished = 0
+    for _ in range(400):
+        seat = obs["focus_seat"]
+        assert set(np.unique(seat)) <= {0, 1}
+        decks = obs["own_deck"][:, :, 0].astype(int).reshape(64, 2, 8)
+        assert (np.sort(decks[np.arange(64), seat], -1) == np.sort(focus)).all()
+        obs = env.step(random_actions(obs, rng, 0.6))
+        finished += int((obs["outcome"] >= 0).sum())
+    assert finished > 20
+
+
+def test_learner_takes_the_focus_seat(tmp_path):
+    from cfbot.config import ModelConfig, TrainConfig
+    from cfbot.league import League
+    from cfbot.model import Policy
+    from cfbot.rollout import Collector
+
+    config = TrainConfig(run_dir=str(tmp_path), simulator="arena", num_envs=24, rollout_steps=40, device="cpu",
+                         self_play_frac=0.0, baseline_frac=1.0, baseline_frac_final=1.0,
+                         model=ModelConfig(d_model=32, n_heads=2, d_card=16, d_board=16, d_trunk=32,
+                                           d_critic=16, critic_hidden=32))
+    env = make_env(config.num_envs, simulator="arena", seed=4, max_skip=config.max_skip)
+    env.set_focus([ARENA_ARCHETYPES["guide_example"]], 1.0)
+    model = Policy(env.spec, config.model)
+    collector = Collector(config, env, model, League(config, env.spec, torch.device("cpu")), seed=4)
+    assert (collector.opponent != 0).all()
+    for _ in range(3):
+        collector.collect(0, 0.0)
+        assert (collector.learner_side == env.focus_seat).all()
 
 
 def parity_game(deck0, deck1, seed, rng, play_prob):

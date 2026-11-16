@@ -76,8 +76,17 @@ class ArenaEnv(Env):
         self.rows = num_envs * 2
         self.device = torch.device(device)
 
+        self.focus_seat = None
+
     def set_focus(self, decks: list[list[str]], prob: float) -> None:
         """Decks one seat (chosen at random) of a new battle plays with chance
         ``prob``, whatever the other seat draws: the decks being prepared for
-        the tournament."""
+        the tournament. ``focus_seat`` then says, per battle, which seat holds
+        one in the running episode (-1 for neither); the collector puts the
+        learner on that seat in league battles, so the practice with these
+        decks goes to the network that is learning and not to a frozen one."""
         self.env.set_focus([card_ids(self.spec, deck) for deck in decks], prob)
+
+    def _obs(self, raw: dict) -> dict[str, torch.Tensor]:
+        self.focus_seat = raw["focus_seat"]
+        return super()._obs(raw)
