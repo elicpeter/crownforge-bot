@@ -12,7 +12,7 @@ cfbot_arena = pytest.importorskip("cfbot_arena")
 
 from cfbot import actions as A  # noqa: E402
 from cfbot.baselines import RushBot  # noqa: E402
-from cfbot.decks import ARENA_ARCHETYPES  # noqa: E402
+from cfbot.decks import ARENA_ARCHETYPES, ARENA_POOL  # noqa: E402
 from cfbot.env import INFO_KEYS, OBS_KEYS, POLICY_KEYS, card_ids, make_env  # noqa: E402
 
 DT, SKIP = 6, 8
@@ -63,6 +63,9 @@ def test_archetypes_are_legal_decks():
     env = cfbot_arena.VecEnv(num_envs=1, workers=1)
     spec = env.spec()
     env.set_pool([tokens(spec, deck) for deck in ARENA_ARCHETYPES.values()])
+    env.set_pool([tokens(spec, deck) for deck in ARENA_POOL.values()])
+    assert len(ARENA_POOL) == len(ARENA_ARCHETYPES) + 12
+    assert not any("barbarian_barrel" in deck for deck in ARENA_POOL.values())
     with pytest.raises(ValueError):
         env.set_pool([tokens(spec, ["knight"] * 8)])
     with pytest.raises(ValueError):

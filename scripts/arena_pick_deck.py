@@ -10,7 +10,7 @@ twice with the seats swapped, against two opponents:
 * ``self``: the same checkpoint holding the opposing deck;
 * ``rush``: the arena's example client, on the deck that client ships with.
 
-Candidates are the archetype decks, the decks of ``--decks`` (a JSON list of
+Candidates are the training pool's decks, the decks of ``--decks`` (a JSON list of
 eight-name lists) and the run's most played self-play decks with a good score
 (``deck_stats.json`` next to the checkpoint). The table is sorted by the score
 against ``self``; ``+/-`` is a 95% interval over deck pairs. Scores within each
@@ -25,7 +25,7 @@ import os
 import random
 
 from cfbot.config import pick_device
-from cfbot.decks import ARENA_ARCHETYPES
+from cfbot.decks import ARENA_ARCHETYPES, ARENA_POOL
 from cfbot.env import make_env
 from cfbot.evaluate import play_paired
 
@@ -44,7 +44,7 @@ def main() -> None:
     simulator = {"simulator": "arena", "crforge_install": None, "crforge_tables": None}
     run_dir = os.path.dirname(os.path.abspath(args.checkpoint))
 
-    candidates = {name: deck for name, deck in ARENA_ARCHETYPES.items()}
+    candidates = {name: deck for name, deck in ARENA_POOL.items()}
     if args.decks:
         for index, deck in enumerate(json.load(open(args.decks))):
             candidates[f"file{index}"] = deck

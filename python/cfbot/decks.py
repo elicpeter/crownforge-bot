@@ -64,9 +64,44 @@ ARENA_ARCHETYPES = {
 }
 
 
+# What training samples as pool decks on the arena: the archetypes with Barbarian
+# Barrel replaced (it spawns no barbarian there), and twelve decks built on how
+# that simulator's cards really behave (docs/arena-deck-research.md): a Miner
+# that hits towers at full damage, an Elixir Golem that pays the defender
+# nothing, an X-Bow that troops do not distract, a Graveyard of twenty
+# skeletons, Royal Delivery as a cheap area hit. ARENA_ARCHETYPES itself stays
+# as it is: the gauntlet's deck pairs are drawn from it, and a rating scale is
+# only one scale while those stay the same.
+ARENA_CANDIDATES = {
+    "healer_elixir_golem": ["elixir_golem", "battle_healer", "night_witch", "phoenix", "firecracker", "earthquake", "tornado", "royal_delivery"],
+    "miner_wall_breakers": ["miner", "poison", "knight", "skeletons", "wall_breakers", "tesla", "bats", "the_log"],
+    "tower_first_xbow": ["xbow", "tesla", "knight", "archers", "skeletons", "ice_spirit", "royal_delivery", "the_log"],
+    "graveyard_hut": ["graveyard", "poison", "knight", "babydragon", "goblin_hut", "ice_wizard", "skeletons", "the_log"],
+    "minion_giant_cycle": ["minion_giant", "knight", "skeletons", "ice_wizard", "bats", "cannon", "lightning", "the_log"],
+    "giant_anti_rush": ["giant", "giant_skeleton", "firecracker", "musketeer", "minipekka", "royal_delivery", "zap", "skeletons"],
+    "lavaloon_anti_air": ["lava_hound", "balloon", "babydragon", "minions", "tombstone", "barbarians", "fireball", "zap"],
+    "hog_delivery_cycle": ["hogrider", "firecracker", "knight", "cannon", "skeletons", "ice_spirit", "the_log", "royal_delivery"],
+    "royal_giant_control": ["royal_giant", "hunter", "knight", "skeletons", "tesla", "lightning", "the_log", "firecracker"],
+    "barrel_air_bait": ["goblin_barrel", "princess", "goblin_gang", "minions", "knight", "inferno_tower", "royal_delivery", "the_log"],
+    "drill_wall_breakers": ["goblin_drill", "wall_breakers", "knight", "firecracker", "bats", "poison", "tesla", "the_log"],
+    "battle_ram_counterpush": ["battle_ram", "bandit", "giant_skeleton", "electro_wizard", "dark_prince", "minions", "royal_delivery", "zap"],
+}
+ARENA_POOL = {
+    **{name: ["the_log" if card == "barbarian_barrel" else card for card in deck]
+       for name, deck in ARENA_ARCHETYPES.items()},
+    **ARENA_CANDIDATES,
+}
+
+
 def archetypes(simulator: str | None) -> dict[str, list[str]]:
-    """The archetype decks under the named simulator's card names."""
+    """The archetype decks under the named simulator's card names: the decks
+    the gauntlet and paired evaluations draw their matchups from."""
     return ARENA_ARCHETYPES if simulator == "arena" else ARCHETYPES
+
+
+def pool_decks(simulator: str | None) -> dict[str, list[str]]:
+    """The decks training samples as pool decks on the named simulator."""
+    return ARENA_POOL if simulator == "arena" else ARCHETYPES
 
 
 def resolve_pool(deck_pool, simulator: str | None = None) -> list[list[str]] | None:
@@ -74,7 +109,7 @@ def resolve_pool(deck_pool, simulator: str | None = None) -> list[list[str]] | N
     if deck_pool is None:
         return None
     if deck_pool == "archetypes":
-        return list(archetypes(simulator).values())
+        return list(pool_decks(simulator).values())
     if isinstance(deck_pool, str):
         raise ValueError(f"unknown deck pool: {deck_pool}")
     return deck_pool
