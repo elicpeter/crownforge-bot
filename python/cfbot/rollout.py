@@ -180,7 +180,7 @@ class Collector:
                     index.append(padded(open_rows.nonzero().squeeze(-1), ROW_BUCKET, len(learner_cpu)))
                 index = torch.cat(index).to(device)
                 picked = index[:gathered]
-                sub = {key: self.obs[key].index_select(0, picked) for key in POLICY_KEYS}
+                sub = env.take(self.obs, picked, POLICY_KEYS)
                 pieces = []
                 start = 0
                 for cpu_rows, run, module, noise in groups:

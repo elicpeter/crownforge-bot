@@ -1,4 +1,5 @@
 /target
+/build
 /sim
 /.venv
 /runs
@@ -7,3 +8,6 @@ __pycache__/
 *.pyc
 *.onnx
 .pytest_cache/
+/arena/cr-rl-arena
+/arena/target
+*.pyd

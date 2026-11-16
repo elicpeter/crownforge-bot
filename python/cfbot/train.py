@@ -23,7 +23,7 @@ import torch
 
 from .config import MODEL_PRESETS, ModelConfig, TrainConfig, override, pick_device
 from .decks import DeckStats, resolve_pool
-from .env import Env
+from .env import make_env, simulator_of
 from .evaluate import run_gauntlet
 from .league import League, rules_label
 from .model import Policy, count_parameters
@@ -133,13 +133,14 @@ def main() -> None:
 
     # A resumed run continues with fresh battles instead of replaying the
     # deck and seed sequence it started with.
-    env = Env(
+    env = make_env(
         config.num_envs,
+        **simulator_of(config),
         workers=config.workers,
         decision_ticks=config.decision_ticks,
         seed=config.seed + iteration,
         max_entities=config.max_entities,
-        deck_pool=resolve_pool(config.deck_pool),
+        deck_pool=resolve_pool(config.deck_pool, config.simulator),
         pool_prob=config.pool_prob,
         mirror_decks=config.mirror_decks,
         max_skip=config.max_skip,
@@ -149,6 +150,10 @@ def main() -> None:
         device=device,
     )
     spec = env.spec
+    if config.focus_decks and config.focus_prob > 0:
+        if not hasattr(env, "set_focus"):
+            raise SystemExit("focus_decks needs the arena simulator")
+        env.set_focus(config.focus_decks, config.focus_prob)
     model = Policy(spec, config.model).to(device)
     optimizer = make_optimizer(model, config)
     league = League(config, spec, device)

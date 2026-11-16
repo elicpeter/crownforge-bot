@@ -29,17 +29,26 @@ import numpy as np
 import torch
 
 from .agent import Agent
-from .baselines import RandomBot, SpendBot
+from .baselines import RandomBot, RushBot, SpendBot
 from .config import DRAFT_CARDS, pick_device
-from .decks import ARCHETYPES
-from .env import Env, card_ids, select_rows
+from .decks import archetypes
+from .env import Env, card_ids, make_env, select_rows, simulator_of
 from .league import load_policy
 
 SCRIPTED = {
     "random": lambda seed: RandomBot(0.2, seed),
     "spend8": lambda seed: SpendBot(8.0, seed),
     "spend5": lambda seed: SpendBot(5.0, seed),
+    "rush": lambda seed: RushBot(0.95, seed),
 }
+
+
+def gauntlet_bots(simulator: str | None) -> list[str]:
+    """The scripted anchors of the rating scale: ``rush`` only where it models
+    a real opponent, the arena's example client."""
+    return [name for name in SCRIPTED if name != "rush" or simulator == "arena"]
+
+
 GAUNTLET_SEED = 20261112
 # A queued game that has not finished after this many steps is abandoned.
 MAX_STEPS = 6000
@@ -63,10 +72,27 @@ class Player:
         return self.bot.act(obs) if self.bot is not None else self.agent.act(obs)
 
 
+def checkpoint_simulator(*sides) -> dict:
+    """The simulator settings stored with the first checkpoint among ``sides``."""
+    for who in sides:
+        if isinstance(who, str) and who not in SCRIPTED and os.path.exists(who):
+            data = torch.load(who, map_location="cpu", weights_only=False)
+            stored = data.get("config") if isinstance(data, dict) else None
+            if stored is None:
+                # A bare snapshot: the run's config sits two directories up.
+                path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(who))), "config.json")
+                if os.path.exists(path):
+                    with open(path) as handle:
+                        stored = json.load(handle)
+            if stored is not None:
+                return simulator_of(stored)
+    return simulator_of({})
+
+
 def deck_pairs(env: Env, count: int, seed: int) -> list[tuple[list[int], list[int]]]:
     """A fixed list of matchups: the archetypes and as many random playable
     decks, drawn from ``seed`` alone."""
-    decks = [card_ids(env.spec, deck) for deck in ARCHETYPES.values()]
+    decks = [card_ids(env.spec, deck) for deck in archetypes(env.spec.get("simulator")).values()]
     decks += env.random_decks(len(decks), seed)
     rng = random.Random(seed)
     return [(rng.choice(decks), rng.choice(decks)) for _ in range(count)]
@@ -83,21 +109,35 @@ def play_paired(
     rules: str | None = None,
     ema: bool = False,
     max_envs: int = 256,
+    simulator: dict | None = None,
+    matchups: list | None = None,
 ) -> dict:
     """Score ``first`` against ``second`` over ``pairs`` deck pairs, two
-    seat-swapped games each."""
+    seat-swapped games each. ``simulator`` holds ``make_env``'s simulator
+    settings; without it a checkpoint path given as ``first`` or ``second``
+    names the simulator it was trained on, and the default is the bundled one.
+    ``matchups`` replaces the standard deck pairs with a given list of
+    ``(first's deck, second's deck)``, as card tokens or card names."""
+    if simulator is None:
+        simulator = checkpoint_simulator(first, second)
     device = torch.device(device)
     scores: list[tuple[float, float]] = []
     wins = draws = losses = crashes = unplayed = 0
     lengths: list[int] = []
     crash_decks: list = []
-    matchups = None
     players = None
+    if matchups is not None:
+        pairs = min(pairs, len(matchups))
     for start in range(0, pairs, max_envs // 2):
         n = min(max_envs // 2, pairs - start)
-        env = Env(2 * n, seed=seed + start, exclude_cards=DRAFT_CARDS, rules=rules, device=device)
-        if matchups is None:
-            matchups = deck_pairs(env, pairs, seed)
+        env = make_env(2 * n, **simulator, seed=seed + start, exclude_cards=DRAFT_CARDS, rules=rules,
+                       device=device)
+        if players is None:
+            if matchups is None:
+                matchups = deck_pairs(env, pairs, seed)
+            else:
+                matchups = [tuple(card_ids(env.spec, deck) if isinstance(deck[0], str) else list(deck)
+                                  for deck in pair) for pair in matchups[:pairs]]
             players = [
                 Player(first, env.spec, device, mode, seed, ema),
                 Player(second, env.spec, device, mode, seed + 1, ema),
@@ -158,14 +198,14 @@ def play_paired(
 def run_gauntlet(model, league, config, device, iteration: int) -> dict:
     """Play the current policy against every anchor and append the result to
     the run's ``gauntlet.jsonl``. Returns numbers for the training log."""
-    opponents: dict[str, object] = {name: name for name in SCRIPTED}
+    opponents: dict[str, object] = {name: name for name in gauntlet_bots(config.simulator)}
     for snapshot in league.anchors()[-config.gauntlet_anchors :]:
         if snapshot["iteration"] < iteration:
             opponents[f"anchor{snapshot['iteration']}"] = league.path(snapshot)
     results = {}
     for name, who in opponents.items():
         outcome = play_paired(model, who, config.gauntlet_pairs, GAUNTLET_SEED, "sample", device,
-                              config.rules)
+                              config.rules, simulator=simulator_of(config))
         results[name] = {key: outcome[key] for key in ("score", "ci95", "games", "crashes")}
         for blue, red in outcome["crash_decks"][:5]:
             print(f"  simulator crash in gauntlet: {blue} vs {red}", flush=True)
@@ -233,6 +273,8 @@ def main() -> None:
     parser.add_argument("--ema", action="store_true", help="use averaged weights where a checkpoint has them")
     parser.add_argument("--rules", default=None, help="'complete' or a rules document path")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--simulator", default=None, choices=["crownforge", "crforge", "arena"],
+                        help="default: the one a checkpoint given as a side was trained on")
     args = parser.parse_args()
     if args.ratings:
         ratings = fit_ratings(read_gauntlet(args.ratings))
@@ -242,7 +284,8 @@ def main() -> None:
     if not (args.first and args.second):
         parser.error("give two sides, or --ratings RUN_DIR")
     result = play_paired(args.first, args.second, args.pairs, args.seed, args.mode,
-                         pick_device(args.device), args.rules, args.ema)
+                         pick_device(args.device), args.rules, args.ema,
+                         simulator=simulator_of({"simulator": args.simulator}) if args.simulator else None)
     print(
         f"{args.first} vs {args.second}: {result['wins']}W {result['draws']}D {result['losses']}L, "
         f"score {result['score']:.3f} +/- {result['ci95']:.3f} over {args.pairs} deck pairs"

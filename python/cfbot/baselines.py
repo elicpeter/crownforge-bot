@@ -54,5 +54,34 @@ class SpendBot:
         return torch.where(play, choice, torch.zeros_like(choice))
 
 
-def make_baselines() -> list:
-    return [RandomBot(0.2), SpendBot(8.0), SpendBot(5.0)]
+class RushBot:
+    """The arena's example client, at this bot's decision rate: whenever it can
+    afford a card it plays one at once, a random card on a random tile of the
+    six rows before the river. The likeliest opponent in a tournament of
+    newcomers, and one that never holds elixir back."""
+
+    name = "rush"
+
+    def __init__(self, play_prob: float = 0.95, seed: int | None = None):
+        self.play_prob = play_prob
+        self.generator = _generator(seed)
+
+    def act(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        from . import actions as A
+
+        legal = obs["legal"]
+        front = torch.zeros(A.HEIGHT, A.WIDTH, dtype=torch.bool)
+        front[9:15, 2:16] = True
+        mask = torch.zeros(legal.shape[-1], dtype=torch.bool)
+        mask[1 : A.PLAY_ACTION_COUNT] = front.flatten().repeat(A.HAND_SLOTS)
+        choice, has_play = _random_legal_play(legal & mask.to(legal.device), self.generator)
+        draw = torch.rand(choice.shape[0], generator=self.generator).to(choice.device)
+        play = has_play & (draw < self.play_prob)
+        return torch.where(play, choice, torch.zeros_like(choice))
+
+
+def make_baselines(simulator: str | None = None) -> list:
+    bots = [RandomBot(0.2), SpendBot(8.0), SpendBot(5.0)]
+    if simulator == "arena":
+        bots.append(RushBot())
+    return bots

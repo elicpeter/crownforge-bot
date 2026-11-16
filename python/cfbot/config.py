@@ -70,6 +70,18 @@ class TrainConfig:
     seed: int = 0
     device: str = "auto"
 
+    # Simulator. "crownforge" is the Rust bridge built with this package.
+    # "crforge" is the CRForge battle core, held tick for tick to battles
+    # recorded in the game; it runs on a JVM and needs its installed env
+    # distribution and a data version's game tables (cfbot/crforge.py; the two
+    # folders may also come from CRFORGE_INSTALL and CRFORGE_TABLES). A model
+    # is tied to the simulator it was trained on: the vocabularies differ.
+    # "arena" is cr-rl-arena, the simulator of an agent tournament, through
+    # the bridge in arena/ (cfbot/arena.py; scripts/setup_arena.sh builds it).
+    simulator: str = "crownforge"
+    crforge_install: str | None = None
+    crforge_tables: str | None = None
+
     # Environment
     num_envs: int = 256
     workers: int = 0
@@ -98,6 +110,12 @@ class TrainConfig:
     pool_prob_final: float = 0.30
     mutant_prob_final: float = 0.25
     deck_ramp_frac: float = 0.15
+    # Arena only. With chance focus_prob one seat of a new battle, chosen at
+    # random, plays one of focus_decks whatever the other seat draws: more
+    # practice with the decks meant for the tournament, against the same spread
+    # of opposing decks.
+    focus_decks: list[list[str]] | None = None
+    focus_prob: float = 0.0
 
     # Rollout and PPO
     rollout_steps: int = 128

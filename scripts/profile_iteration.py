@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from cfbot import ppo, rollout
 from cfbot.config import MODEL_PRESETS, ModelConfig, TrainConfig, override, pick_device
 from cfbot.decks import DeckStats, resolve_pool
-from cfbot.env import Env
+from cfbot.env import Env, make_env, simulator_of
 from cfbot.league import League
 from cfbot.model import Policy, count_parameters
 from cfbot.ppo import Ema, make_optimizer, schedule
@@ -193,9 +193,9 @@ def main() -> None:
     device = pick_device(config.device)
     torch.manual_seed(config.seed)
 
-    env = Env(
-        config.num_envs, workers=config.workers, decision_ticks=config.decision_ticks, seed=config.seed,
-        max_entities=config.max_entities, deck_pool=resolve_pool(config.deck_pool),
+    env = make_env(
+        config.num_envs, **simulator_of(config), workers=config.workers, decision_ticks=config.decision_ticks, seed=config.seed,
+        max_entities=config.max_entities, deck_pool=resolve_pool(config.deck_pool, config.simulator),
         pool_prob=config.pool_prob, mirror_decks=config.mirror_decks, max_skip=config.max_skip,
         exclude_cards=config.exclude_cards, rules=config.rules, level_jitter=config.level_jitter,
         device=device,
@@ -273,6 +273,8 @@ def main() -> None:
     probe.wrap_transfers()
     env.env = StepProxy(env.env, probe)
     probe.wrap(env, "_obs", "obs: wrap arrays as tensors")
+    probe.wrap(env, "_observe", "obs: copy blocks, wrap as tensors")
+    probe.wrap(env, "_refill", "decks: sample next matches")
     probe.wrap(model, "act", "learner: actor forward")
     probe.wrap(model.critic, "forward", "critic forward{ctx}", context=" [critic step]")
     for module in league.slot_modules:

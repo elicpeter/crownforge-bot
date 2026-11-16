@@ -47,7 +47,7 @@ class League:
         self.next_anchor = 0
         self.slot_modules: list[Policy | None] = [None] * config.league_slots
         self.slot_snapshot: list[int | None] = [None] * config.league_slots
-        self.baselines = make_baselines()
+        self.baselines = make_baselines(spec.get("simulator"))
         self.baseline_stats = [{"games": 0.0, "score": 0.0} for _ in self.baselines]
         self.fixed_stats = {"games": 0.0, "score": 0.0}
         self.elo = 0.0

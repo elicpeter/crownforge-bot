@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cfbot-arena"
+version = "0.1.0"
+description = "Batch environment and featurizer for the cr-rl-arena simulator, in cfbot's observation layout"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26"]
+
+[tool.maturin]
+module-name = "cfbot_arena"

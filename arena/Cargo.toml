@@ -1,0 +1,25 @@
+[package]
+name = "cfbot-arena"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "cfbot_arena"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The battle engine itself is not a dependency: `src/lib.rs` compiles the source
+# files of a cr-rl-arena checkout in `cr-rl-arena/` (git-ignored, see README), so
+# the game here is the tournament server's game at that commit.
+numpy = "0.30"
+pyo3 = "0.30"
+rayon = "1.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

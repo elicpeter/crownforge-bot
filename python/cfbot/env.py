@@ -5,7 +5,10 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from . import _env
+try:
+    from . import _env
+except ImportError:  # the Crownforge bridge is not built; the other simulators still work
+    _env = None
 
 # Public inputs of the policy (simulator schema 2 plus bot-owned planes).
 POLICY_KEYS = (
@@ -57,6 +60,8 @@ class Env:
         level_jitter: tuple[int, int] | None = None,
         device: torch.device | str = "cpu",
     ):
+        if _env is None:
+            raise RuntimeError("the Crownforge bridge is not built (maturin develop --release in the repository root)")
         probe = _env.VecEnv(num_envs=1, workers=1, rules=rules)
         spec = probe.spec()
         self.env = _env.VecEnv(
@@ -108,17 +113,23 @@ class Env:
         lazy = device.type == "cuda"
         if not packed:
             return {key: value.to(device, non_blocking=lazy) for key, value in obs.items()}
+        out, blocks = upload_packed(obs, device, lazy)
+        self._packed = (out, blocks)
+        return out
+
+    def take(self, obs: dict[str, torch.Tensor], index: torch.Tensor, keys) -> dict[str, torch.Tensor]:
+        """Rows ``index`` of the planes ``keys``. For the planes of the last
+        packed upload that is one gather per block instead of one per plane;
+        the values are the same."""
+        packed = getattr(self, "_packed", None)
+        if packed is None or obs is not packed[0]:
+            return {key: obs[key].index_select(0, index) for key in keys}
         out = {}
-        lead = next(iter(obs.values())).shape[0]
-        for dtype in {value.dtype for value in obs.values()}:
-            keys = [key for key, value in obs.items() if value.dtype == dtype]
-            block = torch.cat([obs[key].reshape(lead, -1) for key in keys], dim=1)
-            block = block.to(device, non_blocking=lazy)
-            start = 0
-            for key in keys:
-                size = obs[key][0].numel()
-                out[key] = block[:, start : start + size].view(obs[key].shape)
-                start += size
+        for block, layout in packed[1]:
+            rows = block.index_select(0, index)
+            for key, start, size, shape in layout:
+                if key in keys:
+                    out[key] = rows[:, start : start + size].view(len(index), *shape)
         return out
 
     def reset(self, seed: int | None = None) -> dict[str, torch.Tensor]:
@@ -153,6 +164,59 @@ class Env:
         return self.env.deck_retries()
 
 
+def simulator_of(config) -> dict:
+    """The simulator settings of a ``TrainConfig`` (or of a checkpoint's stored
+    config), as keyword arguments for ``make_env``."""
+    get = config.get if isinstance(config, dict) else lambda key, default=None: getattr(config, key, default)
+    return {
+        "simulator": get("simulator", "crownforge") or "crownforge",
+        "crforge_install": get("crforge_install"),
+        "crforge_tables": get("crforge_tables"),
+    }
+
+
+def make_env(
+    num_envs: int,
+    simulator: str = "crownforge",
+    crforge_install: str | None = None,
+    crforge_tables: str | None = None,
+    **settings,
+) -> Env:
+    """A batch of battles on the named simulator. ``settings`` are ``Env``'s."""
+    if simulator == "crownforge":
+        return Env(num_envs, **settings)
+    if simulator == "crforge":
+        from .crforge import CrforgeEnv
+
+        return CrforgeEnv(num_envs, install=crforge_install, tables=crforge_tables, **settings)
+    if simulator == "arena":
+        from .arena import ArenaEnv
+
+        return ArenaEnv(num_envs, **settings)
+    raise ValueError(f"unknown simulator: {simulator}")
+
+
+def upload_packed(obs: dict[str, torch.Tensor], device: torch.device, lazy: bool = False):
+    """CPU planes sent to ``device`` as one block per dtype. Returns the planes
+    as views into those blocks, and the blocks with where each plane sits."""
+    out = {}
+    blocks = []
+    lead = next(iter(obs.values())).shape[0]
+    for dtype in {value.dtype for value in obs.values()}:
+        keys = [key for key, value in obs.items() if value.dtype == dtype]
+        block = torch.cat([obs[key].reshape(lead, -1) for key in keys], dim=1)
+        block = block.to(device, non_blocking=lazy)
+        start = 0
+        layout = []
+        for key in keys:
+            size = obs[key][0].numel()
+            out[key] = block[:, start : start + size].view(obs[key].shape)
+            layout.append((key, start, size, obs[key].shape[1:]))
+            start += size
+        blocks.append((block, layout))
+    return out, blocks
+
+
 def select_rows(obs: dict[str, torch.Tensor], rows: torch.Tensor) -> dict[str, torch.Tensor]:
     return {key: value[rows] for key, value in obs.items()}
 
@@ -180,8 +244,13 @@ def gather_rows(
         value = obs[key]
         if key in ENTITY_KEYS:
             value = value[:, :width]
-        rows[key] = value.index_select(0, where).to(device)
-    return rows
+        rows[key] = value.index_select(0, where)
+    if home == device:
+        return rows
+    if home.type == "cpu" and len(pick):
+        # Twenty small planes: one transfer per dtype costs less than one each.
+        return upload_packed(rows, device)[0]
+    return {key: value.to(device) for key, value in rows.items()}
 
 
 def trim_entities(obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

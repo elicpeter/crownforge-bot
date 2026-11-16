@@ -318,6 +318,241 @@ then draws a level offset per card for each battle; `rules` also accepts a path
 to a rules document for another base level. A checkpoint records the rules it
 was trained on, and loading it under other rules warns and continues.
 
+## The CRForge simulator
+
+`simulator=crforge` trains on [CRForge](https://github.com/voonhous/crforge), a
+Java battle core held tick for tick to battles recorded in the game, instead
+of the Rust simulator behind `sim`. The network, the collector, the league and
+the evaluation are the same code; only the environment differs. A model is
+tied to the simulator it was trained on, because the unit and hazard
+vocabularies differ, and a checkpoint remembers which one that was.
+
+Setup, once (CRForge needs Java 21, and builds its game tables from the game's
+own files, which it does not ship; its `docs/game-tables.md` says where they
+come from):
+
+```sh
+git clone https://github.com/voonhous/crforge ../crforge && cd ../crforge
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)       # macOS; any JDK 21
+./gradlew :env:installDist :tables:dataVersionTables -Pcrforge.assetSource=... -Pcrforge.dataVersion=16.635.3
+cd - && pip install 'jpype1>=1.5,<2'
+scripts/build_crforge.sh ../crforge/env/build/install/env   # compiles java/cfbot/bridge
+export CRFORGE_INSTALL=$PWD/../crforge/env/build/install/env CRFORGE_TABLES=~/.crforge/tables/16.635.3
+python -m pytest -q tests/test_crforge.py
+python -m cfbot.train --run runs/crf --set simulator=crforge --set budget_hours=1
+```
+
+The two folders can also be given as `crforge_install` and `crforge_tables`;
+then the run's `config.json` holds them and `--resume` and `cfbot.evaluate`
+need no environment variables. `JAVA_HOME` must name the JDK in every process
+that uses the simulator. Rebuild the bridge class after pulling CRForge or
+changing `java/`.
+
+How it is put together:
+
+- `java/cfbot/bridge/CfVector.java` owns one CRForge `LadderEnv` per battle and
+  steps them on a thread pool. As on the other simulator, a step gives both
+  seats' actions and then keeps waiting while neither seat has an open play
+  (`max_skip`), so the collector sees the same kind of step. It also writes the
+  observation in this bot's layout, the rewards and the shaping terms, into
+  buffers Python maps once; a step is one call into the JVM.
+- `python/cfbot/crforge.py` holds the card catalogue (the same tokens as the
+  other simulator; 27 cards have another row name in the game's tables), the
+  deck sampler (the same pool, mutation and playability rules) and the `Env`
+  subclass. At start it plays every card once in a battle of its own and
+  leaves out any the battle core refuses; on data 16.635.3 all 123 play.
+- The JVM runs with the throughput collector, a fixed 6 GB heap and explicit
+  collections off (`JVM_ARGS` in `crforge.py`): the first steps a batch about
+  a fifth faster than the default collector, the rest take another 4% off the
+  bridge call. `CFBOT_JVM_ARGS` replaces the options.
+
+What the planes mean there, where it differs:
+
+- The action space is the same 4,611 indices. CRForge has no second play
+  option, so indices from 2,307 are never legal. The legal tiles of a card are
+  the tiles it lands on unmoved (CRForge's mask rule 2).
+- A play runs 20 ticks after it is given. `recent_plays` lists an own play at
+  the tick it was given and an enemy play at the tick it ran.
+- An enemy unit's health is unknown until the game would draw its health bar;
+  it reads as full until then. Tower health is always exact.
+- Hazards are area effects and projectiles in flight, which is more than the
+  other simulator lists (it has no projectiles). The 16 rows are given out in
+  order: area effects, then projectiles a card casts (Fireball, Rocket, a
+  rolling Log, a Goblin Barrel; an Arrows volley of thirty arrows is one
+  hazard at the middle of those still flying), then units' shots, and last
+  the crown towers' own shots and arrows drawn only for show. A tower shoots
+  most of the time, so most rows carry a tower shot.
+- `hazard_overflow` counts only an area or a card's projectile left out, and
+  should stay 0. Shots that found no row (a Hunter fires ten pellets at once)
+  are counted by `Env.shots_dropped()`: 16 in 192,000 rows of random play.
+  Runs made before this ordering (`crf-ctrl-s0`, `crf-ctrl-s1`,
+  `crf-base6h-s0`) gave rows out in the order CRForge lists entities and
+  dropped 165,000 to 230,000 hazards each, an Arrows volley filling the plane
+  by itself.
+- Tower ammunition, the damage stage of a ramping attack and the enchanted
+  flag are not reported (always 0). Raged and slowed come from a unit's speed
+  and its listed buffs.
+- The counted enemy elixir is CRForge's own count of what a player can see.
+- `trade` credits damage to a unit only if a card of its owner's deck deploys
+  that unit, by the unit's row: a unit spawned later that shares a row with a
+  deck card's body (a Witch's skeletons next to the Skeletons card) is counted
+  too. Buildings, clones, units on a timer and units that destroy themselves
+  are worth nothing, as before.
+- `rules` and `level_jitter` belong to the other simulator and are refused.
+  Every card and tower is level 11.
+- `rejected` does not stay at 0: about two plays in a million are refused
+  although the mask offered them. All seen so far are a Mirror given while an
+  earlier play of the same side is still waiting to run, three cases CRForge
+  declines to model and answers by sending nothing (no elixir is spent).
+  `Env.refusals()` lists each refused play with its reason, so anything else
+  shows up there.
+- A play given in a match's last second never runs, because the match is
+  decided first. It still counts as accepted. `Env.run_refused()` lists these.
+
+Throughput on an M2 Max: a one-hour run of the base preset made 7.68M learner
+decisions at 2,560 a second, against 8.30M at 2,739 on the other simulator
+(7% fewer; that run also saw a busier machine, load 2.7 against 2.2). The
+difference is in collecting: 9.4 s an iteration against 8.1 s. The bridge call
+takes about 7.7 ms per step of 256 battles against 5.5 ms, and nearly all of
+it is the battle core itself.
+
+## The arena simulator (cr-rl-arena)
+
+[cr-rl-arena](https://github.com/ilumn/cr-rl-arena) is the simulator of an Elo
+tournament for agents: a Rust battle engine (`cr_sim`), and a server that pairs
+connected agents and plays the matches itself. An agent brings its own
+eight-card deck, sees its own hand and elixir and every unit and tower, and
+answers each tick with a card and a tile or with nothing.
+
+`simulator=arena` trains on that engine. [arena/](arena/) is a second Rust
+extension, `cfbot_arena`. It does not depend on the simulator as a library: it
+compiles the engine's source files from a checkout pinned to one commit, so a
+battle in training is the battle the server plays at that commit. Build it,
+and the stock simulator next to it, with
+
+    scripts/setup_arena.sh                                               # macOS, Linux
+    powershell -ExecutionPolicy Bypass -File scripts\setup_arena.ps1     # Windows
+
+in an environment that already has PyTorch. It needs git and a Rust toolchain
+(and on Windows the Visual Studio C++ build tools). `ARENA_REV` selects the
+commit; use the one the tournament server runs, since a later commit may play
+differently. The Windows script has not been run. On a machine without a
+Crownforge checkout the root package cannot be built; the script then puts
+`python/` on the environment's path instead, which is all this simulator needs.
+
+    python -m cfbot.train --run runs/arena --set simulator=arena --set budget_hours=24
+
+Everything else is as for the other simulators: the same planes, network,
+league, gauntlet and tools. A checkpoint is tied to this simulator and to its
+card list (`spec["rules_digest"]` is a digest of the card data).
+
+### What the policy sees
+
+Only what the server sends, which is less than the other simulators show:
+
+- **Units and towers**: owner, kind, position, health, and whether a unit is
+  still deploying. From those the bridge derives how long a unit has been out
+  (time left to deploy, lifetime left for buildings and timed units) and its
+  velocity over the last decision interval.
+- **Not sent, so not in the planes**: spell areas, projectiles, shields, and
+  every status effect (stun, slow, rage, freeze, invisibility). The hazard
+  plane is always empty and the status columns of the entity plane are zero.
+- **The opponent's cards** are inferred from the units that appear on its
+  side ([arena/src/track.rs](arena/src/track.rs)): units that something
+  already on the board produced (a hut, a Witch, a death spawn) are not counted
+  as plays; a Goblin Barrel or Graveyard is recognised by its units. A spell
+  that leaves no unit (Fireball, Zap, Poison, The Log, ...) is never seen.
+- **The opponent's elixir** is counted from those inferred plays, so it is an
+  upper bound: it does not know about unseen spells, Mirror's surcharge or an
+  Elixir Collector.
+- **Own state** is exact: hand, next card, the card cycle, what Mirror would
+  replay, a card's evolution charge, and the champion's ability cooldown, all
+  counted from the bot's own accepted moves.
+
+The critic's training-only planes hold the opponent's true elixir, hand and
+deck, as before.
+
+### Actions
+
+The same 4,611 flat actions. A play is a hand slot and one of the 576 tiles in
+the player's own frame; both seats see themselves at the bottom, as on the
+server, so nothing is flipped anywhere. The legal mask follows the engine's own
+rule: troops and buildings on the fifteen own rows, plus rows 15 to 20 of a lane
+whose enemy princess tower has fallen; spells, Miner and Goblin Drill anywhere.
+The ability action fires the champion's ability when it is on the board, off
+cooldown and paid for (and, for the Golden Knight's dash, with an enemy in
+reach). Goblinstein's revive is not offered. The secondary play forms do not
+exist here and are never legal.
+
+In the tests every action the mask offers is accepted by the engine.
+
+### The same rows in training and in the tournament
+
+The bridge does not read the engine when it builds the policy's rows. It first
+reduces the engine to a `View`, the contents of the server's `obs` message, and
+everything else is computed from that. The tournament client builds the same
+`View` from the server's JSON and runs the same code (`cfbot_arena.Featurizer`).
+[tests/test_arena.py](tests/test_arena.py) plays whole battles twice, once in
+the bridge and once in the stock simulator driven the way the server drives
+it, and requires every plane of every decision to be bit-identical for both
+seats.
+
+### Decks
+
+`deck_pool=archetypes` uses this simulator's own list
+(`ARENA_ARCHETYPES` in [decks.py](python/cfbot/decks.py)): the familiar shapes
+under the arena's card names, plus the two decks the arena's own material hands
+a newcomer (the guide's example deck and the built-in default). Random decks
+follow the same playability rules as elsewhere. `exclude_cards` names that
+this simulator does not have are skipped.
+
+A tournament entry plays one deck. Two tools for that:
+
+- `focus_decks` and `focus_prob` give one seat of a battle one of the listed
+  decks with that chance, whatever the other seat draws: more practice with
+  the candidate decks against the usual spread of opponents. Both can be set
+  when a run is resumed.
+- `python scripts/arena_pick_deck.py CHECKPOINT` plays the checkpoint on every
+  candidate deck against one fixed list of opposing decks, and against the
+  arena's example client on its own deck, and prints the table.
+
+### Opponents
+
+The league adds one scripted opponent on this simulator, `rush`: the arena's
+example client at this bot's decision rate. Whenever it can afford a card it
+plays one on a random tile of the six rows before the river. It is in the
+gauntlet too, as a fourth fixed anchor of the rating scale.
+
+### Playing in the tournament
+
+    python -m cfbot.arena_client wss://HOST NAME --checkpoint runs/arena/checkpoint.pt \
+        --deck knight,archers,giant,musketeer,skeletons,fireball,arrows,zap
+
+The client joins the queue, answers every observation, and plays match after
+match until stopped; `--log` keeps one JSON line per match. The policy decides
+every `decision_ticks` ticks, as in training, and the client passes at once on
+the other ticks. A decision takes about 10 ms on a laptop CPU against the
+server's limit of 2 s. Ratings are stored under the name, and the server does
+not protect names: anyone can join under yours.
+
+A first check on an M2 Max, base preset, one hour, seed 0: 7.39M learner
+decisions at 2,764 a second (the gradient step is the limit; the bridge steps
+256 battles in under 2 ms), gauntlet rating +55 to +435, no rejected plays and
+no crashes. On the arena's own server that checkpoint won 13 of 20 matches
+against the arena's example client, which had beaten an untrained network 3 to
+0, with no ignored moves. The scripted `rush` bot scored lower against the same
+checkpoint in the gauntlet (0.08) than the real client did (0.35): the client
+plays an all-troop deck, the gauntlet's decks hold spells it wastes. Check
+against the real client before entering.
+
+To try a checkpoint before entering, run the arena's own server locally and
+connect the client and the arena's example client to it:
+
+    pip install ./arena/cr-rl-arena/server
+    CR_ARENA_BIND=127.0.0.1:8765 cr-arena &
+    python arena/cr-rl-arena/server/examples/random_agent.py ws://127.0.0.1:8765 example &
+    python -m cfbot.arena_client ws://127.0.0.1:8765 me --checkpoint ... --deck ... --matches 20
+
 ## Simulator notes
 
 - A deck with three or more ability units (champions) is refused: the
@@ -336,7 +571,8 @@ was trained on, and loading it under other rules warns and continues.
 
 | Path | Contents |
 |---|---|
-| `src/` | Rust bridge: batched battles, featurizer, cycle and elixir tracker, deck sampler |
+| `src/` | Rust bridge to Crownforge: batched battles, featurizer, cycle and elixir tracker, deck sampler |
+| `arena/` | Rust bridge to cr-rl-arena: the same, computed from what the tournament server sends, and the client's featurizer |
 | `python/cfbot/` | Model, PPO, league, decks, training, evaluation, agent, export |
 | `tests/` | End-to-end tests, and the optimized collector, update and network against frozen originals |
 | `scripts/` | Environment smoke test, simulator benchmark, iteration and gradient-step profilers, restart loop |

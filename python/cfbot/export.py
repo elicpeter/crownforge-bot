@@ -26,7 +26,8 @@ import torch
 import torch.nn as nn
 
 from .config import DRAFT_CARDS
-from .env import POLICY_KEYS, Env
+from .env import POLICY_KEYS, make_env
+from .evaluate import checkpoint_simulator
 from .league import load_policy
 
 
@@ -47,7 +48,9 @@ def main() -> None:
     parser.add_argument("--ema", action="store_true", help="export the averaged weights")
     args = parser.parse_args()
 
-    env = Env(max(1, args.rows // 2), workers=1, exclude_cards=DRAFT_CARDS)
+    # The example batch comes from the simulator the checkpoint was trained on.
+    env = make_env(max(1, args.rows // 2), **checkpoint_simulator(args.checkpoint), workers=1,
+                   exclude_cards=DRAFT_CARDS)
     model, _ = load_policy(args.checkpoint, env.spec, torch.device("cpu"), ema=args.ema)
     deploy = Deploy(model).eval()
 
