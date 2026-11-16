@@ -87,9 +87,10 @@ watch:
 
 ### Measuring strength
 
-Every 2% of the run the agent plays a gauntlet: the three scripted bots and
+Every 2% of the run the agent plays a gauntlet against scripted bots and
 frozen snapshots of itself taken at doubling iterations, always on the same 32
-deck pairs and seeds, each pair played from both seats. Results go to
+deck pairs and seeds, each pair played from both seats. The arena has additional
+[fixed opponents](#opponents). Results go to
 `gauntlet.jsonl`, and one Bradley-Terry rating scale is fitted over all of them
 with the random bot at 0.
 
@@ -528,7 +529,32 @@ A tournament entry plays one deck. Two tools for that:
 The league adds one scripted opponent on this simulator, `rush`: the arena's
 example client at this bot's decision rate. Whenever it can afford a card it
 plays one on a random tile of the six rows before the river. It is in the
-gauntlet too, as a fourth fixed anchor of the rating scale.
+gauntlet too, alongside six deterministic opponents with fixed decks.
+
+| Opponent | Playstyle |
+|---|---|
+| `hog-cycle` | Sends Hog Rider at the bridge, cycles cheap cards, and pulls building-targeting units with Cannon. |
+| `golem-beatdown` | Banks elixir for Golem and builds support behind it, with earlier commitments in double elixir. |
+| `bridge-pressure` | Sends Battle Ram at the bridge and punishes heavy deployments in the opposite lane. |
+| `xbow-siege` | Sets up X-Bow in a clear lane and protects it with cheap defenders and Tesla. |
+| `log-bait` | Pressures with Princess and Goblin Barrel, defends with Inferno Tower, and finishes weakened towers with Rocket. |
+| `graveyard-control` | Builds Goblin Hut pressure and casts Graveyard when a friendly troop tanks or the target lane lacks splash defenders. |
+
+The policies use the visible arena state and adapt placements and defenses to
+the matchup. The playstyles follow [Supercell's archetype guide](https://supercell.com/en/games/clashroyale/blog/fun/archetype-deck-challenge/)
+and [classic deck guide](https://supercell.com/en/games/clashroyale/blog/fun/list-of-classic-decks-in-the-challenge/).
+
+```sh
+python -m cfbot.evaluate CHECKPOINT --suite --pairs 32 --ema
+python -m cfbot.evaluate CHECKPOINT --suite --deck hog_delivery_cycle --pairs 32 --ema
+python -m cfbot.evaluate CHECKPOINT xbow-siege --pairs 64 --ema
+```
+
+By default the checkpoint plays a seeded mix of archetype and random decks. Use
+`--deck` with a pool deck name or eight comma-separated arena card names to
+hold its tournament deck fixed. Each pair plays twice with the seats swapped.
+The suite reports each matchup separately. Existing runs begin logging the new
+opponents at their next arena gauntlet, when the Elo fit also gains six anchors.
 
 ### Playing in the tournament
 

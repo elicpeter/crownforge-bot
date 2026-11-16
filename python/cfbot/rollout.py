@@ -9,9 +9,11 @@ import torch
 import torch.nn.functional as F
 
 from . import actions as A
+from .baselines import LaneBot
 from .config import TrainConfig
-from .decks import DeckStats
+from .decks import DeckStats, resolve_pool
 from .env import (
+    card_ids,
     CRITIC_KEYS, ENTITY_KEYS, POLICY_KEYS, Env, entity_width, gather_rows, observed_towers,
     tower_potential,
 )
@@ -41,6 +43,10 @@ def padded(index: torch.Tensor, multiple: int, limit: int | None = None) -> torc
         size = max(len(index), min(size, limit))
     extra = size - len(index)
     return torch.cat([index, index[:1].expand(extra)]) if extra else index
+
+
+# What a scripted bot may read of an observation.
+BOT_KEYS = ("legal", "global", "hand", "own_deck", "entities")
 
 
 class Collector:
@@ -78,6 +84,15 @@ class Collector:
             self.learner_side = np.where(focus >= 0, focus, self.learner_side).astype(np.int64)
         # Games whose opponent changed mid-game do not count for ratings.
         self.tainted = np.zeros(env.num_envs, dtype=bool)
+        # Battles against a lane-pressure bot that holds a chosen deck (arena).
+        self.pressure = np.zeros(env.num_envs, dtype=bool)
+        self.pressure_decks: list[list[int]] = []
+        if config.pressure_decks:
+            self.deck_rng = np.random.default_rng(seed + 23)
+            self.pressure_decks = [card_ids(env.spec, deck) for deck in config.pressure_decks]
+            self.focus_decks = [card_ids(env.spec, deck) for deck in config.focus_decks or []]
+            self.pool_decks = [card_ids(env.spec, deck)
+                               for deck in resolve_pool(config.deck_pool, env.spec.get("simulator")) or []]
         self.relayout(0.0)
 
     def relayout(self, progress: float) -> None:
@@ -86,6 +101,27 @@ class Collector:
         layout = np.asarray(self.league.layout(progress, self.env.num_envs), dtype=np.int64)
         self.tainted |= layout != self.opponent
         self.opponent = layout
+        if self.pressure_decks:
+            lane = np.array([self.league.is_baseline(o) and isinstance(self.league.baseline(o), LaneBot)
+                             for o in layout.tolist()])
+            for index in np.nonzero(lane & ~self.pressure)[0]:
+                self._queue_pressure(int(index))
+            self.pressure = lane
+
+    def _queue_pressure(self, index: int) -> None:
+        """Set up battle ``index``'s next game: the learner in the first seat
+        with a focus, pool or random deck, the lane bot with a pressure deck."""
+        rng = self.deck_rng
+        draw = rng.random()
+        if self.focus_decks and draw < self.config.focus_prob:
+            mine = self.focus_decks[rng.integers(len(self.focus_decks))]
+        elif self.pool_decks and rng.random() < 0.5:
+            mine = self.pool_decks[rng.integers(len(self.pool_decks))]
+        else:
+            mine = self.env.random_decks(1, int(rng.integers(1 << 31)))[0]
+        theirs = self.pressure_decks[rng.integers(len(self.pressure_decks))]
+        self.learner_side[index] = 0
+        self.env.queue_match(index, list(mine), list(theirs))
 
     def taint(self, opponents: list[int]) -> None:
         if opponents:
@@ -226,7 +262,7 @@ class Collector:
             # after the networks, in id order, as they always have: on a CPU
             # device they share the networks' random generator.
             for idx, bot in bots:
-                actions[idx] = bot.act({"legal": obs_cpu["legal"][idx], "global": obs_cpu["global"][idx]})
+                actions[idx] = bot.act({key: obs_cpu[key][idx] for key in BOT_KEYS})
 
             potential_before = tower_potential(observed_towers(obs_cpu))
             stats["forced_wait"] += float((~choice).float().mean())
@@ -288,6 +324,10 @@ class Collector:
                 focus = getattr(self.env, "focus_seat", None)
                 if focus is not None and focus[index] >= 0:
                     self.learner_side[index] = int(focus[index])
+                if self.pressure[index]:
+                    # The game that has just started is the one queued last
+                    # time, learner first; line up the one after it.
+                    self._queue_pressure(int(index))
                 self.tainted[index] = False
 
         obs = self._stack(obs_steps)

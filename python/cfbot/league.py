@@ -25,7 +25,7 @@ import random
 
 import torch
 
-from .baselines import make_baselines
+from .baselines import baseline_label, make_baselines
 from .config import ModelConfig, TrainConfig
 from .model import Policy
 
@@ -47,7 +47,7 @@ class League:
         self.next_anchor = 0
         self.slot_modules: list[Policy | None] = [None] * config.league_slots
         self.slot_snapshot: list[int | None] = [None] * config.league_slots
-        self.baselines = make_baselines(spec.get("simulator"))
+        self.baselines = make_baselines(spec.get("simulator"), spec)
         self.baseline_stats = [{"games": 0.0, "score": 0.0} for _ in self.baselines]
         self.fixed_stats = {"games": 0.0, "score": 0.0}
         self.elo = 0.0
@@ -227,7 +227,7 @@ class League:
         out = {"lineage_elo": round(self.elo, 1), "snapshots": len(self.snapshots)}
         for bot, stats in zip(self.baselines, self.baseline_stats):
             if stats["games"] >= 5:
-                key = f"win_{bot.name}{getattr(bot, 'threshold', '')}"
+                key = f"win_{baseline_label(bot)}"
                 out[key] = round(stats["score"] / stats["games"], 3)
         if self.fixed and self.fixed_stats["games"] >= 5:
             out["win_fixed"] = round(self.fixed_stats["score"] / self.fixed_stats["games"], 3)
@@ -242,6 +242,7 @@ class League:
             "next_anchor": self.next_anchor,
             "slot_snapshot": self.slot_snapshot,
             "baseline_stats": self.baseline_stats,
+            "baseline_names": [baseline_label(bot) for bot in self.baselines],
             "fixed_stats": self.fixed_stats,
             "elo": self.elo,
         }
@@ -264,7 +265,11 @@ class League:
             int(state.get("next_id", 0)), 1 + max((s["id"] for s in snapshots), default=-1)
         )
         self.next_anchor = state.get("next_anchor", 0)
-        self.baseline_stats = state["baseline_stats"]
+        # A checkpoint from before the scripted opponents changed keeps the
+        # counts of the ones that are still here and starts the others afresh.
+        names = state.get("baseline_names") or ["random", "spend8.0", "spend5.0", "rush"]
+        old = dict(zip(names, state["baseline_stats"]))
+        self.baseline_stats = [old.get(baseline_label(bot), {"games": 0.0, "score": 0.0}) for bot in self.baselines]
         self.fixed_stats = state.get("fixed_stats", self.fixed_stats)
         self.elo = state["elo"]
         self.slot_snapshot = [None] * self.num_slots

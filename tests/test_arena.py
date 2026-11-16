@@ -275,6 +275,56 @@ def test_a_spawner_elsewhere_does_not_hide_a_spell():
     assert {"tombstone", "graveyard"} <= seen
 
 
+def test_clones_are_a_spell_not_cards_and_the_engine_picks_the_ready_champion():
+    cr_sim = pytest.importorskip("cr_sim")
+    mine = ["archer_queen", "clone", "knight", "archers", "giant", "musketeer", "ice_spirit", "zap"]
+    theirs = ["knight", "clone", "archers", "giant", "musketeer", "skeletons", "fireball", "zap"]
+    battle = cr_sim.Battle()
+    battle.reset(11, mine, theirs)
+    feats = [cfbot_arena.Featurizer(mine, DT), cfbot_arena.Featurizer(theirs, DT)]
+    names = feats[0].card_names()
+    done = [set(), set()]
+    spot = [None, None]
+    offered = accepted = 0
+    for tick in range(3000):
+        obs = [battle.view(seat).observe() for seat in (0, 1)]
+        acts = [None, None]
+        for seat, (first, own) in enumerate((("archer_queen", mine), ("knight", theirs))):
+            feats[seat].update(obs[seat])
+            view = battle.view(seat)
+            hand, elixir = view.hand(), view.elixir()
+            cost = dict(zip(hand, view.hand_cost()))
+            if seat == 0 and tick % DT == 0 and "clone" in done[0]:
+                rows = feats[0].observe()
+                if rows["legal"][0, A.PLAY_ACTION_COUNT]:
+                    offered += 1
+                    acts[0] = feats[0].act(A.PLAY_ACTION_COUNT)
+                    continue
+            if first not in done[seat] and first in hand and elixir >= cost[first]:
+                acts[seat] = (hand.index(first), 9.5, 6.5)
+                done[seat].add(first)
+                spot[seat] = tick
+            elif first in done[seat] and "clone" not in done[seat] and "clone" in hand and elixir >= cost["clone"] \
+                    and tick > spot[seat] + 30:
+                where = next((e[2], e[3]) for e in obs[seat]["entities"] if e[0] == 0 and e[1] == first)
+                acts[seat] = (hand.index("clone"), where[0], where[1])
+                done[seat].add("clone")
+            elif "clone" not in done[seat] and elixir >= 9.5:
+                slot = next(i for i, card in enumerate(hand) if card not in (first, "clone"))
+                acts[seat] = (slot, 2.5, 2.5)
+        if battle.step(*acts):
+            break
+        if acts[0] is not None and acts[0][0] == cfbot_arena.ABILITY_SLOT:
+            accepted += battle.last_action(0) == "ok"
+        if offered >= 3:
+            break
+    assert done[1] == {"knight", "clone"} and offered >= 1 and accepted == offered
+    rows = feats[0].observe()
+    seen = {names[int(t)]: int(count) for t, count in zip(rows["revealed_deck"][0, :, 0], rows["revealed_deck"][0, :, 2]) if t}
+    # The opponent played one Knight and one Clone: the copy is not a second Knight.
+    assert seen.get("knight") == 1 and seen.get("clone") == 1
+
+
 def test_ground_troops_are_not_offered_the_water():
     env = cfbot_arena.VecEnv(num_envs=48, workers=4, seed=6)
     spec = env.spec()
@@ -303,6 +353,38 @@ def test_ground_troops_are_not_offered_the_water():
         obs = env.step(random_actions(obs, rng, 0.5))
     assert checked > 50 and wet > 0
     assert cards.shape[0] == len(spec["card_names"])
+
+
+def test_lane_bots_hold_the_pressure_decks(tmp_path):
+    from cfbot.baselines import LaneBot
+    from cfbot.config import ModelConfig, TrainConfig
+    from cfbot.league import League
+    from cfbot.model import Policy
+    from cfbot.rollout import Collector
+
+    pressure = [ARENA_POOL["three_musketeers"], ARENA_POOL["mega_knight"]]
+    config = TrainConfig(run_dir=str(tmp_path), simulator="arena", num_envs=32, rollout_steps=64, device="cpu",
+                         self_play_frac=0.0, baseline_frac=1.0, baseline_frac_final=1.0,
+                         pressure_decks=pressure,
+                         model=ModelConfig(d_model=32, n_heads=2, d_card=16, d_board=16, d_trunk=32,
+                                           d_critic=16, critic_hidden=32))
+    env = make_env(config.num_envs, simulator="arena", seed=4, max_skip=config.max_skip,
+                   deck_pool=list(ARENA_POOL.values()), pool_prob=0.3)
+    league = League(config, env.spec, torch.device("cpu"))
+    assert sum(isinstance(bot, LaneBot) for bot in league.baselines) == 2
+    collector = Collector(config, env, Policy(env.spec, config.model), league, seed=4)
+    assert collector.pressure.sum() == 16
+    wanted = {tuple(sorted(card_ids(env.spec, deck))) for deck in pressure}
+    for _ in range(8):
+        collector.collect(0, 0.0)
+    decks = collector.obs_cpu["own_deck"][:, :, 0].long().view(32, 2, 8)
+    held = np.array([tuple(sorted(decks[i, 1].tolist())) in wanted for i in range(32)])
+    # After the game that was running when the bots were assigned, every game
+    # there has the bot on a pressure deck and the learner in the first seat.
+    assert held[collector.pressure].mean() > 0.9 and held[~collector.pressure].mean() < 0.3
+    assert (collector.learner_side[collector.pressure] == 0).all()
+    # The lane bots do put cards on the board with them.
+    assert league.summary().get("win_lanerush") is not None
 
 
 def test_make_env_and_scripted_bots():

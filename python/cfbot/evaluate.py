@@ -2,13 +2,14 @@
 
     python -m cfbot.evaluate runs/main/checkpoint.pt random --pairs 200
     python -m cfbot.evaluate A.pt B.pt --mode greedy
+    python -m cfbot.evaluate runs/arena/checkpoint.pt --suite --pairs 32
     python -m cfbot.evaluate --ratings runs/main
 
-Each side is a checkpoint path or a scripted bot: ``random``, ``spend8``,
-``spend5``. A comparison plays a fixed list of deck pairs. Every pair is played
-twice from the same seed with the seats swapped, so the first side holds the
-same deck in both games; one game is counted per battle slot, so short games
-are not over-represented; and a simulator crash is reported, not scored.
+Each side is a checkpoint path, an arena benchmark profile, or a scripted bot
+named ``random``, ``spend8``, ``spend5``, or ``rush``. Every deck pair is played
+twice from the same seed with the seats swapped. Each side holds the same deck
+in both games. Each battle slot contributes at most one game, and simulator
+crashes are reported separately from scores.
 
 During training the same routine runs as a gauntlet against fixed anchors
 (the scripted bots and frozen snapshots at doubling iterations), always on the
@@ -29,9 +30,9 @@ import numpy as np
 import torch
 
 from .agent import Agent
-from .baselines import RandomBot, RushBot, SpendBot
+from .baselines import LaneBot, RandomBot, RushBot, SpendBot
 from .config import DRAFT_CARDS, pick_device
-from .decks import archetypes
+from .decks import ARENA_ARCHETYPES, ARENA_CANDIDATES, ARENA_POOL, archetypes
 from .env import Env, card_ids, make_env, select_rows, simulator_of
 from .league import load_policy
 
@@ -41,11 +42,27 @@ SCRIPTED = {
     "spend5": lambda seed: SpendBot(5.0, seed),
     "rush": lambda seed: RushBot(0.95, seed),
 }
+# Arena-only scripted opponents that read more of the observation and need
+# the card table: single-lane pressure, at once or in saved-up pushes.
+ARENA_SCRIPTED = {
+    "lanerush": lambda seed, spec: LaneBot(spec, "rush", seed),
+    "lanepush": lambda seed, spec: LaneBot(spec, "push", seed),
+}
+ARENA_BENCHMARK_DECKS = {
+    "hog-cycle": ARENA_ARCHETYPES["hog_cycle"],
+    "golem-beatdown": ARENA_POOL["golem"],
+    "bridge-pressure": ARENA_CANDIDATES["battle_ram_counterpush"],
+    "xbow-siege": ARENA_CANDIDATES["tower_first_xbow"],
+    "log-bait": ARENA_ARCHETYPES["log_bait"],
+    "graveyard-control": ARENA_CANDIDATES["graveyard_hut"],
+}
 
 
 def gauntlet_bots(simulator: str | None) -> list[str]:
-    """The scripted anchors of the rating scale: ``rush`` only where it models
-    a real opponent, the arena's example client."""
+    """The scripted anchors of the rating scale for this simulator."""
+    # The benchmark profiles are not in here: they are slow to play, and a
+    # run's rating scale should not change its opponents half way. Play them
+    # with --suite.
     return [name for name in SCRIPTED if name != "rush" or simulator == "arena"]
 
 
@@ -62,6 +79,16 @@ class Player:
         self.bot = self.agent = None
         if isinstance(who, str) and who in SCRIPTED:
             self.bot = SCRIPTED[who](seed)
+        elif isinstance(who, str) and who in ARENA_SCRIPTED:
+            if spec.get("simulator") != "arena":
+                raise ValueError(f"{who} needs the arena simulator")
+            self.bot = ARENA_SCRIPTED[who](seed, spec)
+        elif isinstance(who, str) and who in ARENA_BENCHMARK_DECKS:
+            if spec.get("simulator") != "arena":
+                raise ValueError("arena benchmark profiles require the arena simulator")
+            from .arena_benchmarks import ArenaBenchmarkBot
+
+            self.bot = ArenaBenchmarkBot(who, spec)
         elif isinstance(who, str):
             model, _ = load_policy(who, spec, torch.device(device), ema=ema)
             self.agent = Agent(model, mode=mode, seed=seed)
@@ -72,21 +99,40 @@ class Player:
         return self.bot.act(obs) if self.bot is not None else self.agent.act(obs)
 
 
+def _checkpoint_settings(who) -> dict | None:
+    if (not isinstance(who, str) or who in SCRIPTED or who in ARENA_BENCHMARK_DECKS
+            or not os.path.exists(who)):
+        return None
+    data = torch.load(who, map_location="cpu", weights_only=False)
+    stored = data.get("config") if isinstance(data, dict) else None
+    if stored is None:
+        # A bare snapshot: the run's config sits two directories up.
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(who))), "config.json")
+        if os.path.exists(path):
+            with open(path) as handle:
+                stored = json.load(handle)
+    return simulator_of(stored) if stored is not None else None
+
+
 def checkpoint_simulator(*sides) -> dict:
     """The simulator settings stored with the first checkpoint among ``sides``."""
     for who in sides:
-        if isinstance(who, str) and who not in SCRIPTED and os.path.exists(who):
-            data = torch.load(who, map_location="cpu", weights_only=False)
-            stored = data.get("config") if isinstance(data, dict) else None
-            if stored is None:
-                # A bare snapshot: the run's config sits two directories up.
-                path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(who))), "config.json")
-                if os.path.exists(path):
-                    with open(path) as handle:
-                        stored = json.load(handle)
-            if stored is not None:
-                return simulator_of(stored)
+        settings = _checkpoint_settings(who)
+        if settings is not None:
+            return settings
     return simulator_of({})
+
+
+def _evaluation_simulator(first, second, simulator: dict | None) -> dict:
+    if not any(isinstance(who, str) and who in ARENA_BENCHMARK_DECKS for who in (first, second)):
+        return checkpoint_simulator(first, second) if simulator is None else simulator
+    if simulator is not None and simulator.get("simulator") != "arena":
+        raise ValueError("arena benchmark profiles require the arena simulator")
+    for who in (first, second):
+        settings = _checkpoint_settings(who)
+        if settings is not None and settings["simulator"] != "arena":
+            raise ValueError(f"{who} was trained on {settings['simulator']}. Arena benchmarks require an arena checkpoint.")
+    return simulator if simulator is not None else simulator_of({"simulator": "arena"})
 
 
 def deck_pairs(env: Env, count: int, seed: int) -> list[tuple[list[int], list[int]]]:
@@ -117,9 +163,9 @@ def play_paired(
     settings; without it a checkpoint path given as ``first`` or ``second``
     names the simulator it was trained on, and the default is the bundled one.
     ``matchups`` replaces the standard deck pairs with a given list of
-    ``(first's deck, second's deck)``, as card tokens or card names."""
-    if simulator is None:
-        simulator = checkpoint_simulator(first, second)
+    ``(first's deck, second's deck)``, as card tokens or card names. An arena
+    benchmark selects the arena simulator and uses its fixed deck in every pair."""
+    simulator = _evaluation_simulator(first, second, simulator)
     device = torch.device(device)
     scores: list[tuple[float, float]] = []
     wins = draws = losses = crashes = unplayed = 0
@@ -135,9 +181,20 @@ def play_paired(
         if players is None:
             if matchups is None:
                 matchups = deck_pairs(env, pairs, seed)
-            else:
-                matchups = [tuple(card_ids(env.spec, deck) if isinstance(deck[0], str) else list(deck)
-                                  for deck in pair) for pair in matchups[:pairs]]
+            fixed_decks = []
+            for who in (first, second):
+                deck = ARENA_BENCHMARK_DECKS.get(who) if isinstance(who, str) else None
+                fixed_decks.append(card_ids(env.spec, deck) if deck is not None else None)
+            resolved_matchups = []
+            for pair in matchups[:pairs]:
+                decks = []
+                for fixed, deck in zip(fixed_decks, pair, strict=True):
+                    if fixed is not None:
+                        decks.append(fixed)
+                    else:
+                        decks.append(card_ids(env.spec, deck) if isinstance(deck[0], str) else list(deck))
+                resolved_matchups.append(tuple(decks))
+            matchups = resolved_matchups
             players = [
                 Player(first, env.spec, device, mode, seed, ema),
                 Player(second, env.spec, device, mode, seed + 1, ema),
@@ -266,7 +323,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("first", nargs="?")
     parser.add_argument("second", nargs="?")
-    parser.add_argument("--ratings", metavar="RUN_DIR", help="print gauntlet ratings of a run")
+    command = parser.add_mutually_exclusive_group()
+    command.add_argument("--ratings", metavar="RUN_DIR", help="print gauntlet ratings of a run")
+    command.add_argument("--suite", action="store_true", help="play the first side against the arena benchmark suite")
+    parser.add_argument("--deck", help="first side's deck for --suite, as an arena pool name or eight comma-separated cards")
     parser.add_argument("--pairs", type=int, default=100, help="deck pairs; two games each")
     parser.add_argument("--mode", default="sample", choices=["sample", "greedy"])
     parser.add_argument("--seed", type=int, default=1234)
@@ -274,25 +334,51 @@ def main() -> None:
     parser.add_argument("--rules", default=None, help="'complete' or a rules document path")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--simulator", default=None, choices=["crownforge", "crforge", "arena"],
-                        help="default: the one a checkpoint given as a side was trained on")
+                        help="defaults to arena for benchmark profiles or the simulator from the checkpoint")
     args = parser.parse_args()
+    deck = None
+    if args.deck is not None:
+        if not args.suite:
+            parser.error("--deck requires --suite")
+        if args.first in ARENA_BENCHMARK_DECKS:
+            parser.error(f"{args.first} uses its fixed benchmark deck")
+        deck = ARENA_POOL.get(args.deck)
+        if deck is None:
+            if "," not in args.deck:
+                parser.error(f"unknown arena pool deck {args.deck!r}")
+            deck = [card.strip() for card in args.deck.split(",")]
+            if len(deck) != 8 or len(set(deck)) != 8 or not all(deck):
+                parser.error("--deck expects eight distinct card names")
     if args.ratings:
         ratings = fit_ratings(read_gauntlet(args.ratings))
         for name, rating in sorted(ratings.items(), key=lambda item: item[1]):
             print(f"{name:>12s} {rating:8.1f}")
         return
-    if not (args.first and args.second):
-        parser.error("give two sides, or --ratings RUN_DIR")
-    result = play_paired(args.first, args.second, args.pairs, args.seed, args.mode,
-                         pick_device(args.device), args.rules, args.ema,
-                         simulator=simulator_of({"simulator": args.simulator}) if args.simulator else None)
-    print(
-        f"{args.first} vs {args.second}: {result['wins']}W {result['draws']}D {result['losses']}L, "
-        f"score {result['score']:.3f} +/- {result['ci95']:.3f} over {args.pairs} deck pairs"
-        f" ({result['crashes']} crashed, {result['unplayed']} unplayed)"
-    )
-    for blue, red in result["crash_decks"]:
-        print("simulator crash:", blue, "vs", red)
+    if args.suite:
+        if not args.first or args.second:
+            parser.error("give one side with --suite")
+        opponents = list(ARENA_BENCHMARK_DECKS)
+    else:
+        if not (args.first and args.second):
+            parser.error("give two sides, one side with --suite, or --ratings RUN_DIR")
+        opponents = [args.second]
+    device = pick_device(args.device)
+    simulator = simulator_of({"simulator": args.simulator}) if args.simulator else None
+    for opponent in opponents:
+        matchups = [(deck, ARENA_BENCHMARK_DECKS[opponent])] * args.pairs if deck is not None else None
+        try:
+            result = play_paired(args.first, opponent, args.pairs, args.seed, args.mode, device,
+                                 args.rules, args.ema, simulator=simulator, matchups=matchups)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(
+            f"{args.first} vs {opponent}: {result['wins']}W {result['draws']}D {result['losses']}L, "
+            f"score {result['score']:.3f} +/- {result['ci95']:.3f} over {args.pairs} deck pairs"
+            f" ({result['crashes']} crashed, {result['unplayed']} unplayed)",
+            flush=True,
+        )
+        for blue, red in result["crash_decks"]:
+            print("simulator crash:", blue, "vs", red)
 
 
 if __name__ == "__main__":

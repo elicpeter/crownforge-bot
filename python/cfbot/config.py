@@ -116,6 +116,12 @@ class TrainConfig:
     # of opposing decks.
     focus_decks: list[list[str]] | None = None
     focus_prob: float = 0.0
+    # Arena only. Decks the league's lane-pressure bots hold. A scripted rush is
+    # no test on a random deck and a real one on a strong deck, so their battles
+    # are set up match by match: the bot gets one of these, the learner a focus
+    # deck (with focus_prob), a pool deck or a random one. None leaves the bots
+    # on whatever the sampler deals.
+    pressure_decks: list[list[str]] | None = None
 
     # Rollout and PPO
     rollout_steps: int = 128

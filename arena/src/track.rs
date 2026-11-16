@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::cards::{AbilityKind, CardType, Library};
+use crate::cards::{AbilityKind, CardType, Library, SpellEffect};
 use crate::view::{View, ACT_OK};
 
 /// The action slot that fires the champion's ability.
@@ -53,6 +53,8 @@ pub struct Meta {
     pub base_of: Vec<Option<usize>>,
     /// Elixir one body of this unit is worth, for trade accounting.
     pub body_value: Vec<f32>,
+    /// The spell that copies units, if the library has one.
+    pub clone_card: Option<usize>,
 }
 
 impl Meta {
@@ -92,14 +94,17 @@ impl Meta {
             let card = if def.deployable { Some(id) } else { base_of[id] };
             let Some(card) = card else { continue };
             // Only bodies a card itself deploys, each at an equal share of its cost.
-            // Bodies that destroy themselves by design are worth nothing.
-            if def.ctype != CardType::Troop || def.suicide || def.lifetime_ticks > 0 {
+            // Bodies that destroy themselves by design are worth nothing: their
+            // remaining health would be credited to the defender when they go
+            // (a Battle Ram that connects and splits, a spirit, a timed troop).
+            if def.ctype != CardType::Troop || def.suicide || def.dies_on_hit || def.lifetime_ticks > 0 {
                 continue;
             }
             let bodies = (def.count.max(1) + lib.defs[card].deploy_spawn_count.max(0)) as f32;
             body_value[id] = lib.defs[card].elixir as f32 / bodies;
         }
-        Meta { lib, spawn_src, death_src, spell_src, secondary_of, base_of, body_value }
+        let clone_card = lib.defs.iter().position(|def| def.deployable && def.effect == SpellEffect::Clone);
+        Meta { lib, spawn_src, death_src, spell_src, secondary_of, base_of, body_value, clone_card }
     }
 
     pub fn has_ability(&self, def: usize) -> bool {
@@ -160,8 +165,13 @@ pub struct Tracker {
     evo: Vec<i32>,
     pending: Option<(i32, f32, f32)>,
     prev_hand: [usize; 4],
-    /// Own champion on the board and the tick its ability is ready again.
-    champion: Option<(u32, i64)>,
+    /// The own champion whose ability the engine would fire: the oldest one
+    /// that has finished deploying (a Clone or Mirror can put two on the board).
+    champion: Option<u32>,
+    /// The tick each own champion's ability is ready again, by unit.
+    ready: HashMap<u32, i64>,
+    /// When a batch of cloned units was last seen arriving.
+    clone_seen: i64,
     pub reveals: Vec<Reveal>,
     pub opp_plays: u32,
     pub opp_elixir: f64,
@@ -186,6 +196,8 @@ impl Tracker {
             pending: None,
             prev_hand: [0; 4],
             champion: None,
+            ready: HashMap::new(),
+            clone_seen: i64::MIN / 2,
             reveals: Vec::with_capacity(8),
             opp_plays: 0,
             opp_elixir: 5.0,
@@ -208,6 +220,8 @@ impl Tracker {
         self.pending = None;
         self.prev_hand = [0; 4];
         self.champion = None;
+        self.ready.clear();
+        self.clone_seen = i64::MIN / 2;
         self.reveals.clear();
         self.opp_plays = 0;
         self.opp_elixir = 5.0;
@@ -258,7 +272,8 @@ impl Tracker {
     /// (0 ready, 1 still deploying, 2 cooling down, 3 too little elixir, 4 a
     /// dash with no enemy in reach).
     pub fn ability(&self, meta: &Meta, view: &View) -> Option<(usize, bool, u8)> {
-        let (id, ready_at) = self.champion?;
+        let id = self.champion?;
+        let ready_at = self.ready.get(&id).copied().unwrap_or(0);
         let ent = view.ents.iter().find(|e| e.mine && e.id == id)?;
         let d = &meta.lib.defs[ent.def];
         let state = if ent.deploying {
@@ -287,10 +302,10 @@ impl Tracker {
         if let Some((slot, x, y)) = self.pending.take() {
             if view.last_action == ACT_OK && self.started {
                 if slot == ABILITY_SLOT {
-                    if let Some((id, _)) = self.champion {
+                    if let Some(id) = self.champion {
                         if let Some(ent) = view.ents.iter().find(|e| e.mine && e.id == id) {
                             let cooldown = lib.defs[ent.def].ability_cooldown_ticks.max(1) as i64;
-                            self.champion = Some((id, view.tick - 1 + cooldown));
+                            self.ready.insert(id, view.tick - 1 + cooldown);
                         }
                     }
                 } else if (0..4).contains(&slot) {
@@ -323,10 +338,13 @@ impl Tracker {
         self.groups.clear();
         let grid = decision_ticks > 0 && view.tick % decision_ticks == 0;
         let seconds = decision_ticks as f64 / 20.0;
-        let mut champion = None;
+        // Own units come oldest first: the first champion that is ready to act
+        // is the engine's choice, and one still deploying only stands in for it.
+        let mut champion: Option<(u32, bool)> = None;
+        let mut clones = (0u32, 0.0, 0.0);
         for e in &view.ents {
-            if e.mine && champion.is_none() && meta.has_ability(e.def) {
-                champion = Some(e.id);
+            if e.mine && meta.has_ability(e.def) && champion.map_or(true, |c| c.1 && !e.deploying) {
+                champion = Some((e.id, e.deploying));
             }
             match self.mem.get_mut(&e.id) {
                 Some(mem) => {
@@ -353,7 +371,12 @@ impl Tracker {
                             velocity: [0.0; 2],
                         },
                     );
-                    if !e.mine && !e.tower && self.started {
+                    if !e.mine && !e.tower && self.started && e.hp == 1 && e.max_hp > 1 && !e.deploying {
+                        // A Clone's copy: one health, ready at once. Not a card's body.
+                        clones.0 += 1;
+                        clones.1 += e.x;
+                        clones.2 += e.y;
+                    } else if !e.mine && !e.tower && self.started {
                         match self.groups.iter_mut().find(|g| g.0 == e.def) {
                             Some(group) => {
                                 group.1 += 1;
@@ -375,35 +398,24 @@ impl Tracker {
             }
         }
         self.mem.retain(|_, mem| mem.last == now);
-        match (champion, self.champion) {
-            (Some(id), Some((old, _))) if id == old => {}
-            (Some(id), _) => self.champion = Some((id, 0)),
-            (None, _) => self.champion = None,
-        }
+        self.champion = champion.map(|c| c.0);
+        let mem = &self.mem;
+        self.ready.retain(|id, _| mem.contains_key(id));
 
         // ---- which of the arrivals are cards the opponent played ----
+        if let Some(card) = meta.clone_card.filter(|_| clones.0 > 0 && now - self.clone_seen > 40) {
+            self.clone_seen = now;
+            let centre = [clones.1 / clones.0 as f64, clones.2 / clones.0 as f64];
+            self.opponent_played(meta, card, centre, now);
+        }
         self.groups.sort_by_key(|g| g.0);
         for index in 0..self.groups.len() {
             let (def, count, sum_x, sum_y) = self.groups[index];
             let centre = [sum_x / count as f64, sum_y / count as f64];
             if let Some(card) = self.card_behind(meta, view, def, count, centre) {
-                let x = centre[0] as f32;
-                let y = centre[1] as f32;
-                self.opp_plays += 1;
-                let opp_plays = self.opp_plays;
-                if let Some(index) = self.reveals.iter().position(|r| r.card == card) {
-                    let seen = &mut self.reveals[index];
-                    seen.last_tick = view.tick;
-                    seen.count += 1;
-                    seen.last_play = opp_plays;
-                } else if self.reveals.len() < 8 {
-                    self.reveals.push(Reveal { card, last_tick: view.tick, count: 1, last_play: opp_plays });
-                }
-                self.opp_elixir = (self.opp_elixir - lib.defs[card].elixir as f64).max(0.0);
-                self.push_play(Play { mine: false, card, x, y, tick: view.tick - 1 });
+                self.opponent_played(meta, card, centre, now);
             }
         }
-
         // ---- the opponent's elixir refills whether or not we saw it spent ----
         let from = if self.started { self.tick } else { view.tick };
         for tick in from..view.tick {
@@ -412,6 +424,22 @@ impl Tracker {
         self.tick = view.tick;
         self.prev_hand = view.hand;
         self.started = true;
+    }
+
+    /// Count a card the opponent was seen to play at `centre` on the tick before `tick`.
+    fn opponent_played(&mut self, meta: &Meta, card: usize, centre: [f64; 2], tick: i64) {
+        self.opp_plays += 1;
+        let opp_plays = self.opp_plays;
+        if let Some(index) = self.reveals.iter().position(|r| r.card == card) {
+            let seen = &mut self.reveals[index];
+            seen.last_tick = tick;
+            seen.count += 1;
+            seen.last_play = opp_plays;
+        } else if self.reveals.len() < 8 {
+            self.reveals.push(Reveal { card, last_tick: tick, count: 1, last_play: opp_plays });
+        }
+        self.opp_elixir = (self.opp_elixir - meta.lib.defs[card].elixir as f64).max(0.0);
+        self.push_play(Play { mine: false, card, x: centre[0] as f32, y: centre[1] as f32, tick: tick - 1 });
     }
 
     fn push_play(&mut self, play: Play) {
