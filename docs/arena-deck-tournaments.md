@@ -104,5 +104,5 @@ pool decks (512 games a deck, iteration 6000 on both sides):
 | tournament 3 #1 | 0.751 | 0.040 | archers, elixir_golem, goblins, mighty_miner, musketeer, royal_ghost, spear_goblins, zap |
 
 The two best lines are a focus deck (0.851) and tournament 3's eighth (0.844);
-the other 22 lie between 0.751 and 0.812, inside each other's error. The focus
+the other 21 lie between 0.751 and 0.812, inside each other's error. The focus
 decks were not changed after this tournament.
