@@ -19,7 +19,12 @@ scores as high as one that wins fairly. Read the top of the table as
 candidates for focus decks, not as a verdict.
 
 Results are written next to the checkpoint as ``deck_tournament.json`` after
-every round, so a stopped tournament still leaves its standings.
+every round (``--out`` renames it), with a copy per stage, so a stopped
+tournament still leaves its standings and the early rounds' wider tables stay.
+``--decks`` enters given decks, an earlier tournament's best for one, and
+mutates them too; ``--mutant-any`` sets how often a mutation reaches for any
+card instead of a well-scoring one, which is how a card the run's statistics
+do not favour gets tried inside a strong deck.
 """
 
 import argparse
@@ -84,7 +89,9 @@ def play_round(env, agent, decks, matches, device, seed, label=""):
             pad = (-len(choice)) % BUCKET
             index = torch.cat([choice, choice[:1].expand(pad)]).to(device)
             rows = trim_entities({key: obs[key].index_select(0, index) for key in POLICY_KEYS})
-            actions[choice] = agent.act(rows).cpu()[: len(choice)]
+            # On CUDA, the precision the policy was trained and collected in.
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                actions[choice] = agent.act(rows).cpu()[: len(choice)]
         obs, info = env.step(actions)
         steps += 1
         for slot in np.nonzero((info["outcome"] >= 0) & info["queued"])[0]:
@@ -114,6 +121,15 @@ def main() -> None:
     parser.add_argument("--envs", type=int, default=512)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--ema", action="store_true")
+    parser.add_argument("--decks", default=None, metavar="FILE",
+                        help="JSON list of decks (or of entries with a 'deck') to enter as 'given' and to mutate")
+    parser.add_argument("--mutant-any", type=float, default=0.3,
+                        help="share of a mutation's new cards drawn from all cards, not the best-scoring ones")
+    parser.add_argument("--mutate-given", action="store_true",
+                        help="mutate only the decks of --decks, not the self-play favourites or the pool")
+    parser.add_argument("--only-given", action="store_true",
+                        help="the field is the --decks file alone: no pool, self-play favourites or generated decks")
+    parser.add_argument("--out", default="deck_tournament.json", help="result file name, next to the checkpoint")
     args = parser.parse_args()
     device = pick_device("auto")
     rng = random.Random(args.seed)
@@ -137,10 +153,20 @@ def main() -> None:
         if key not in field and len(set(deck)) == 8:
             field[key] = {"deck": list(deck), "source": source}
 
-    for name, deck in ARENA_POOL.items():
+    given = []
+    if args.decks:
+        with open(args.decks) as handle:
+            given = [entry["deck"] if isinstance(entry, dict) else entry for entry in json.load(handle)]
+        for deck in given:
+            add(deck, "given")
+    if args.only_given:
+        args.random = args.top = args.mutants = 0
+    for name, deck in ({} if args.only_given else ARENA_POOL).items():
         add(deck, f"pool:{name}")
     stats_path = os.path.join(run_dir, "deck_stats.json")
     stats = json.load(open(stats_path)) if os.path.exists(stats_path) else {"cards": {}, "decks": []}
+    if args.only_given:
+        stats = {"cards": {}, "decks": []}
     seen = [entry for entry in stats["decks"] if entry["games"] >= 100]
     seen.sort(key=lambda entry: -entry["score"])
     for entry in seen:
@@ -165,14 +191,16 @@ def main() -> None:
             add(deck, "top-cards")
             made += 1
     # One or two cards of a strong deck replaced by a good card.
-    bases = [entry["deck"] for entry in seen[:16]] + list(ARENA_POOL.values())
+    bases = given + [entry["deck"] for entry in seen[:16]] + list(ARENA_POOL.values())
+    if args.mutate_given and given:
+        bases = given
     good = [c for c, _ in scored] or cards
     made = tries = 0
     while made < args.mutants and tries < args.mutants * 400:
         tries += 1
         deck = list(rng.choice(bases))
         for _ in range(rng.choice((1, 1, 2))):
-            card = rng.choice(good if rng.random() < 0.7 else cards)
+            card = rng.choice(cards if rng.random() < args.mutant_any else good)
             if card not in deck:
                 deck[rng.randrange(8)] = card
         if ok(deck) and tuple(sorted(deck)) not in field:
@@ -192,14 +220,17 @@ def main() -> None:
     agent = Agent(model, mode="sample", seed=args.seed)
     decks = [entry["tokens"] for entry in entries]
     alive = list(range(len(entries)))
-    out_path = os.path.join(run_dir, "deck_tournament.json")
+    out_path = os.path.join(run_dir, args.out)
 
     def save(stage):
         ranked = sorted(alive, key=lambda i: -entries[i]["rounds"][-1][0]) if entries[alive[0]]["rounds"] else alive
-        with open(out_path, "w") as handle:
-            json.dump({"checkpoint": args.checkpoint, "stage": stage, "field": len(entries), "sources": sources,
-                       "standing": [{"deck": entries[i]["deck"], "source": entries[i]["source"],
-                                     "rounds": entries[i]["rounds"]} for i in ranked]}, handle, indent=1)
+        result = {"checkpoint": args.checkpoint, "stage": stage, "field": len(entries), "sources": sources,
+                  "standing": [{"deck": entries[i]["deck"], "source": entries[i]["source"],
+                                "rounds": entries[i]["rounds"]} for i in ranked]}
+        # The latest standing, and one file per stage: a later stage holds fewer decks.
+        for path in (out_path, out_path.replace(".json", f".{stage.replace(' ', '_')}.json")):
+            with open(path, "w") as handle:
+                json.dump(result, handle, indent=1)
 
     def round_of(games, label):
         # Each deck meets `games` opponents drawn from the survivors: games/2 random pairings.
