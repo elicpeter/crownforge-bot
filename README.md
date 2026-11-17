@@ -662,7 +662,7 @@ Each row is +/- 0.044. Tile look-ahead over 3,072 games scores 0.732 against
 difference that these samples show. `scope=all` gains less and loses ground
 with more weight: a rollout in which the opponent never answers is a poor judge
 of when to commit. The opponent in all of this is the same network, so the gain
-against other bots is not measured. On one CPU core set the client then takes
+against other bots is not measured. On the CPU (four threads) the client then takes
 37 ms a decision (worst seen 84 ms) for `tile` and 100 ms (161 ms) for `all`.
 
 Other play-time settings, same setup, seed 781: temperature 0.8, 0.6 and 0.4
