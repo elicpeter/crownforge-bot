@@ -35,6 +35,7 @@ mod rng;
 
 mod decks;
 mod feat;
+mod search;
 mod track;
 mod view;
 
@@ -43,7 +44,7 @@ use std::{
     sync::Arc,
 };
 
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::{
     exceptions::PyValueError,
     prelude::*,
@@ -537,12 +538,55 @@ fn write_rows<'py>(py: Python<'py>, d: &Bound<'py, PyDict>, all: &[&Rows], priva
     Ok(())
 }
 
+/// The result of rolling candidates out: the observation rows at the end of
+/// each rollout, `[rows * k, ...]`, with `ok` (the engine carried the move
+/// out), `ended` and `result` (+1 won, -1 lost) for rollouts the battle ended in.
+fn write_leaves<'py>(py: Python<'py>, rows: &[Rows], leaves: &[search::Leaf]) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    let all: Vec<&Rows> = rows.iter().collect();
+    write_rows(py, &d, &all, false)?;
+    d.set_item("ok", leaves.iter().map(|leaf| leaf.ok).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("ended", leaves.iter().map(|leaf| leaf.done).collect::<Vec<_>>().into_pyarray(py))?;
+    d.set_item("result", leaves.iter().map(|leaf| leaf.result).collect::<Vec<_>>().into_pyarray(py))?;
+    Ok(d)
+}
+
+/// Roll every candidate of one player out. A candidate that is no action, or
+/// that makes the engine panic, comes back as not ok.
+#[allow(clippy::too_many_arguments)]
+fn roll_candidates(
+    meta: &Meta,
+    view: &View,
+    tracker: &Tracker,
+    eng: &mut Engine,
+    scratch: &mut View,
+    candidates: &[i64],
+    horizon: u32,
+    decision_ticks: u32,
+    rows: &mut [Rows],
+    leaves: &mut [search::Leaf],
+) {
+    for ((&index, rows), leaf) in candidates.iter().zip(rows.iter_mut()).zip(leaves.iter_mut()) {
+        *leaf = search::Leaf::default();
+        let Some(action) = search::candidate(index) else { continue };
+        let rolled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            search::rollout(meta, view, tracker, eng, scratch, action, horizon, decision_ticks, rows)
+        }));
+        match rolled {
+            Ok(result) => *leaf = result,
+            Err(_) => *eng = Engine::new(meta.lib.clone()),
+        }
+    }
+}
+
 #[pyclass]
 struct VecEnv {
     context: Context,
     pool: rayon::ThreadPool,
     slots: Vec<Slot>,
     max_entities: usize,
+    /// Rows the look-ahead writes into, kept between calls.
+    leaf_rows: Vec<Rows>,
 }
 
 #[pymethods]
@@ -602,7 +646,7 @@ impl VecEnv {
             master_seed: seed,
         };
         let slots = (0..num_envs).map(|index| Slot::new(&context, index, max_entities)).collect();
-        Ok(Self { context, pool, slots, max_entities })
+        Ok(Self { context, pool, slots, max_entities, leaf_rows: Vec::new() })
     }
 
     #[getter]
@@ -765,6 +809,58 @@ impl VecEnv {
         Ok(d)
     }
 
+    /// Look ahead for some rows. `rows[i]` is an observation row (`env * 2 +
+    /// seat`) and `candidates[i]` its flat action indices to try (a negative
+    /// index is skipped). Each candidate is played from what that row's player
+    /// sees, never from the engine's hidden state, and the board then runs
+    /// `horizon` ticks with nobody playing a card. Returns the observation
+    /// rows at the end of every rollout, `[len(rows) * k, ...]`, with `ok`,
+    /// `ended` and `result`. The battles themselves are not touched.
+    fn search<'py>(
+        &mut self,
+        py: Python<'py>,
+        rows: Vec<usize>,
+        candidates: PyReadonlyArray2<'py, i64>,
+        horizon: u32,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let candidates = candidates.as_array();
+        let (n, k) = candidates.dim();
+        if n != rows.len() || k == 0 || n == 0 {
+            return Err(PyValueError::new_err("candidates must be [len(rows), k] with rows and k at least 1"));
+        }
+        if rows.iter().any(|&row| row >= self.slots.len() * 2) {
+            return Err(PyValueError::new_err("row out of range"));
+        }
+        let flat: Vec<i64> = candidates.iter().copied().collect();
+        while self.leaf_rows.len() < n * k {
+            self.leaf_rows.push(Rows::new(self.max_entities));
+        }
+        let mut leaves = vec![search::Leaf::default(); n * k];
+        let context = &self.context;
+        let slots = &self.slots;
+        let leaf_rows = &mut self.leaf_rows[..n * k];
+        py.detach(|| {
+            self.pool.install(|| {
+                leaf_rows
+                    .par_chunks_mut(k)
+                    .zip(leaves.par_chunks_mut(k))
+                    .zip(flat.par_chunks(k))
+                    .zip(rows.par_iter())
+                    .for_each_init(
+                        || (Engine::new(context.meta.lib.clone()), View::default()),
+                        |(eng, scratch), (((out, leaves), candidates), &row)| {
+                            let (slot, seat) = (&slots[row / 2], row % 2);
+                            roll_candidates(
+                                &context.meta, &slot.views[seat], &slot.trackers[seat], eng, scratch,
+                                candidates, horizon, context.decision_ticks, out, leaves,
+                            );
+                        },
+                    );
+            });
+        });
+        write_leaves(py, &self.leaf_rows[..n * k], &leaves)
+    }
+
     /// The sampler never draws a deck the engine refuses.
     fn deck_retries(&self) -> u64 {
         0
@@ -825,6 +921,10 @@ struct Featurizer {
     rows: Rows,
     decision_ticks: u32,
     max_entities: usize,
+    /// The look-ahead's own engine and rows.
+    engine: Engine,
+    scratch: View,
+    leaf_rows: Vec<Rows>,
 }
 
 impl Featurizer {
@@ -857,6 +957,9 @@ impl Featurizer {
             rows: Rows::new(max_entities),
             decision_ticks,
             max_entities,
+            engine: Engine::new(Library::default_lib()),
+            scratch: View::default(),
+            leaf_rows: Vec::new(),
         })
     }
 
@@ -924,6 +1027,23 @@ impl Featurizer {
     /// Whether anything but waiting is possible on the latest observation.
     fn has_choice(&self) -> bool {
         feat::has_choice(&self.meta, &self.view, &self.tracker)
+    }
+
+    /// Look ahead from the latest observation: play each flat action index of
+    /// `candidates` and run `horizon` ticks on, as `VecEnv.search` does.
+    fn search<'py>(&mut self, py: Python<'py>, candidates: Vec<i64>, horizon: u32) -> PyResult<Bound<'py, PyDict>> {
+        if candidates.is_empty() {
+            return Err(PyValueError::new_err("no candidates"));
+        }
+        while self.leaf_rows.len() < candidates.len() {
+            self.leaf_rows.push(Rows::new(self.max_entities));
+        }
+        let mut leaves = vec![search::Leaf::default(); candidates.len()];
+        roll_candidates(
+            &self.meta, &self.view, &self.tracker, &mut self.engine, &mut self.scratch, &candidates, horizon,
+            self.decision_ticks, &mut self.leaf_rows[..candidates.len()], &mut leaves,
+        );
+        write_leaves(py, &self.leaf_rows[..candidates.len()], &leaves)
     }
 
     /// The server action for flat action `index`, `[slot, x, y]`, or `None` to

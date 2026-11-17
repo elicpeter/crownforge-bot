@@ -155,6 +155,7 @@ pub struct Resolved {
     pub playable: bool,
 }
 
+#[derive(Clone)]
 pub struct Tracker {
     pub deck: [usize; 8],
     /// Value of `plays` when each deck card was last played; 0 means never.
@@ -237,6 +238,23 @@ impl Tracker {
     /// centre, in tiles. The next view says whether it was carried out.
     pub fn note_action(&mut self, slot: i32, x: f32, y: f32) {
         self.pending = Some((slot, x, y));
+    }
+
+    /// Ticks until own champion `id` may use its ability again.
+    pub fn ability_wait(&self, id: u32, tick: i64) -> i32 {
+        self.ready.get(&id).map_or(0, |&ready| (ready - tick).max(0) as i32)
+    }
+
+    /// Own deck cards that are neither in hand nor next, in the order they
+    /// return: the one played longest ago first, cards not yet played before
+    /// those (their order among themselves is not known).
+    pub fn rest_of_cycle(&self, view: &View) -> Vec<usize> {
+        let mut rest: Vec<(u32, usize)> = (0..8)
+            .filter(|&index| !view.hand.contains(&self.deck[index]) && self.deck[index] != view.next)
+            .map(|index| (self.last_play[index], self.deck[index]))
+            .collect();
+        rest.sort_by_key(|entry| entry.0);
+        rest.into_iter().map(|entry| entry.1).collect()
     }
 
     /// Plays by this side since deck slot `index` was last played.

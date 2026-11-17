@@ -35,6 +35,7 @@ from .config import DRAFT_CARDS, pick_device
 from .decks import ARENA_ARCHETYPES, ARENA_CANDIDATES, ARENA_POOL, archetypes
 from .env import Env, card_ids, make_env, select_rows, simulator_of
 from .league import load_policy
+from .search import Searcher
 
 SCRIPTED = {
     "random": lambda seed: RandomBot(0.2, seed),
@@ -76,8 +77,10 @@ class Player:
     a loaded policy."""
 
     def __init__(self, who, spec: dict, device, mode: str, seed: int, ema: bool = False):
-        self.bot = self.agent = None
-        if isinstance(who, str) and who in SCRIPTED:
+        self.bot = self.agent = self.searcher = None
+        if isinstance(who, Searcher):
+            self.searcher = who
+        elif isinstance(who, str) and who in SCRIPTED:
             self.bot = SCRIPTED[who](seed)
         elif isinstance(who, str) and who in ARENA_SCRIPTED:
             if spec.get("simulator") != "arena":
@@ -95,7 +98,14 @@ class Player:
         else:
             self.agent = Agent(who, mode=mode, seed=seed)
 
-    def act(self, obs) -> torch.Tensor:
+    def act(self, obs, env=None, rows=None) -> torch.Tensor:
+        """Actions for ``obs``, this player's rows. A look-ahead player also
+        needs the environment and which of its rows these are."""
+        if self.searcher is not None:
+            where = rows.cpu().numpy()
+            return self.searcher.act(
+                obs, lambda picked, candidates: env.env.search(where[picked].tolist(), candidates, self.searcher.horizon)
+            )
         return self.bot.act(obs) if self.bot is not None else self.agent.act(obs)
 
 
@@ -212,7 +222,7 @@ def play_paired(
         for _ in range(MAX_STEPS):
             actions = torch.zeros(env.rows, dtype=torch.int64, device=device)
             for player, player_rows in zip(players, rows):
-                actions[player_rows] = player.act(select_rows(obs, player_rows))
+                actions[player_rows] = player.act(select_rows(obs, player_rows), env, player_rows)
             obs, info = env.step(actions)
             for index in np.nonzero((info["outcome"] >= 0) & info["queued"] & pending)[0]:
                 pending[index] = False

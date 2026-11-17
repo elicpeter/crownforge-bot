@@ -32,13 +32,14 @@ from .agent import Agent
 from .arena import bridge
 from .env import POLICY_KEYS
 from .league import load_policy
+from .search import Searcher
 
 
 class Player:
     """One checkpoint and one deck: observation dict in, server action out."""
 
     def __init__(self, checkpoint: str, deck: list[str], device: str = "cpu", mode: str = "sample",
-                 temperature: float = 1.0, seed: int = 0, ema: bool = False):
+                 temperature: float = 1.0, seed: int = 0, ema: bool = False, search: dict | None = None):
         self.deck = list(deck)
         self.device = torch.device(device)
         data = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -49,6 +50,10 @@ class Player:
         spec = self.featurizer.spec()
         model, _ = load_policy(checkpoint, spec, self.device, ema=ema)
         self.agent = Agent(model, mode=mode, seed=seed, temperature=temperature)
+        # Look-ahead (cfbot.search): the settings of a Searcher, or None for the plain policy.
+        self.searcher = None
+        if search is not None:
+            self.searcher = Searcher(model, temperature=temperature, greedy=mode == "greedy", seed=seed, **search)
         self.decisions = 0
         self.policy_seconds = 0.0
         self.failed = False
@@ -64,11 +69,17 @@ class Player:
         started = time.perf_counter()
         rows = self.featurizer.observe()
         public = {key: torch.from_numpy(rows[key]).to(self.device) for key in POLICY_KEYS}
-        flat = int(self.agent.act(public)[0])
+        if self.searcher is not None:
+            flat = int(self.searcher.act(public, self._rollouts)[0])
+        else:
+            flat = int(self.agent.act(public)[0])
         action = self.featurizer.act(flat)
         self.decisions += 1
         self.policy_seconds += time.perf_counter() - started
         return list(action) if action else None
+
+    def _rollouts(self, picked, candidates):
+        return self.featurizer.search(candidates[0].tolist(), self.searcher.horizon)
 
     def safe_act(self, obs: dict):
         try:
@@ -145,6 +156,20 @@ async def run(args, player: Player) -> None:
             delay = min(delay * 2, 30.0)
 
 
+def search_settings(text: str | None) -> dict | None:
+    """``scope=tile,cells=4,horizon=40,weight=20`` as Searcher's keyword arguments."""
+    if not text:
+        return None
+    kinds = {"scope": str, "cells": int, "horizon": int, "weight": float, "wait_floor": lambda v: v == "1"}
+    settings = {}
+    for item in text.split(","):
+        key, _, value = item.partition("=")
+        if key not in kinds:
+            raise SystemExit(f"--search: unknown setting '{key}' (known: {', '.join(kinds)})")
+        settings[key] = kinds[key](value)
+    return settings
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("url", help="ws://host:port or wss://host")
@@ -155,13 +180,16 @@ def main() -> None:
     parser.add_argument("--mode", default="sample", choices=["sample", "greedy"])
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--ema", action="store_true", help="play the averaged weights")
+    parser.add_argument("--search", default=None, metavar="SETTINGS",
+                        help="look ahead before moving (cfbot.search), e.g. scope=tile,cells=4,horizon=40,weight=20")
     parser.add_argument("--seed", type=int, default=int(time.time()))
     parser.add_argument("--matches", type=int, default=None, help="stop after this many matches")
     parser.add_argument("--log", default=None, help="append one JSON line per match here")
     args = parser.parse_args()
     torch.set_num_threads(max(1, min(4, torch.get_num_threads())))
     deck = [card.strip() for card in args.deck.split(",") if card.strip()]
-    player = Player(args.checkpoint, deck, args.device, args.mode, args.temperature, args.seed, args.ema)
+    player = Player(args.checkpoint, deck, args.device, args.mode, args.temperature, args.seed, args.ema,
+                    search_settings(args.search))
     print(f"{args.checkpoint}: deciding every {player.decision_ticks} ticks, deck {', '.join(deck)}", flush=True)
     try:
         asyncio.run(run(args, player))

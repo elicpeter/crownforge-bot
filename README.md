@@ -615,6 +615,62 @@ connect the client and the arena's example client to it:
     python arena/cr-rl-arena/server/examples/random_agent.py ws://127.0.0.1:8765 example &
     python -m cfbot.arena_client ws://127.0.0.1:8765 me --checkpoint ... --deck ... --matches 20
 
+### Looking ahead at play time
+
+    python -m cfbot.arena_client wss://HOST NAME --checkpoint ... --deck ... \
+        --search scope=tile,cells=4,horizon=40,weight=20
+
+With `--search` the client tries moves before it sends one (`cfbot/search.py`,
+`arena/src/search.rs`). The bridge rebuilds an engine from the latest
+observation, plays each candidate in it, runs the board `horizon` ticks on with
+nobody playing another card, and the policy's public value head scores the
+position that results. The move is drawn from `log pi + weight * value` over
+the candidates. Training does not change; this is a setting of the client.
+
+- `scope=tile`: the policy chooses when to play and which card, the look-ahead
+  chooses among that card's `cells` most likely tiles.
+- `scope=all`: waiting, every playable card's best tiles and the ability are
+  compared.
+
+The engine is nearly deterministic (its random numbers go to the deck shuffle
+and to scatter such as Graveyard's), which is what makes a rollout worth
+something. But the server does not show everything, and a rebuilt engine
+starts without it: projectiles in flight, spells still falling, lingering
+spell areas, stuns and slows, attack timers and targets, damaged shields, the
+opponent's hand. The opponent plays nothing in a rollout. After one decision of
+both players waiting, clock, elixir, hand and cycle are exact and the unit rows
+are identical in 45% of positions. Every candidate is rolled out under the same
+omissions, so the comparison is fairer than any one rollout is accurate.
+
+Measured on an M2 Max with the iteration-3850 snapshot of the long run, the
+look-ahead side on the eight focus decks, the same snapshot sampling on pool
+decks, 512 games a row, two seeds:
+
+| first side | seed 781 | seed 912 |
+|---|---|---|
+| plain policy, sampled | 0.674 | 0.677 |
+| `scope=tile,cells=4,horizon=40,weight=20` | 0.735 | 0.732 |
+| `scope=tile,cells=8,horizon=40,weight=60` | 0.721 | |
+| `scope=tile,cells=4,horizon=20,weight=20` | | 0.721 |
+| `scope=tile,cells=4,horizon=80,weight=20` | | 0.740 |
+| `scope=tile,cells=4,horizon=40,weight=8` | | 0.741 |
+| `scope=all,cells=2,horizon=40,weight=20` | 0.718 | |
+| `scope=all,cells=2,horizon=40,weight=60` | 0.688 | |
+
+Each row is +/- 0.044. Tile look-ahead over 3,072 games scores 0.732 against
+0.676 for the plain policy over 1,024, about 47 Elo; horizon and weight make no
+difference that these samples show. `scope=all` gains less and loses ground
+with more weight: a rollout in which the opponent never answers is a poor judge
+of when to commit. The opponent in all of this is the same network, so the gain
+against other bots is not measured. On one CPU core set the client then takes
+37 ms a decision (worst seen 84 ms) for `tile` and 100 ms (161 ms) for `all`.
+
+Other play-time settings, same setup, seed 781: temperature 0.8, 0.6 and 0.4
+scored 0.680, 0.695 and 0.645, the policy's most likely tile with a sampled
+card 0.670, and `--mode greedy` 0.474. Greedy play loses about 140 Elo, because
+the policy gives waiting most of the probability on any one decision; nothing
+else differs from sampling at temperature 1 by more than the noise.
+
 ## Simulator notes
 
 - A deck with three or more ability units (champions) is refused: the

@@ -419,3 +419,113 @@ def test_policy_runs_on_arena_rows():
     legal = obs["legal"].bool()
     assert legal.gather(1, out["flat"].view(-1, 1)).all()
     env.step(out["flat"])
+
+
+# ------------------------------------------------------------- look-ahead
+
+
+def candidates_of(obs, rng, k):
+    """Waiting and up to ``k - 1`` offered plays per row; -1 where there are none."""
+    legal = obs["legal"]
+    out = np.full((legal.shape[0], k), -1, dtype=np.int64)
+    out[:, 0] = 0
+    for row in range(legal.shape[0]):
+        options = np.flatnonzero(legal[row][1:]) + 1
+        pick = rng.choice(options, size=min(k - 1, len(options)), replace=False)
+        out[row, 1 : 1 + len(pick)] = pick
+    return out
+
+
+def test_look_ahead_plays_what_is_offered_and_leaves_the_battles_alone():
+    """Every offered play is carried out in the rebuilt engine as well, and a
+    battle that was looked ahead from goes on exactly like one that was not."""
+    rng = np.random.default_rng(0)
+    envs = [cfbot_arena.VecEnv(num_envs=8, workers=2, seed=5, max_skip=0) for _ in range(2)]
+    obs = [env.reset() for env in envs]
+    rolled = same = 0
+    for step in range(160):
+        acts = random_actions(obs[0], rng, 0.25)
+        if step % 8 == 7:
+            cands = candidates_of(obs[0], rng, 6)
+            leaves = envs[0].search(list(range(16)), cands, 12)
+            ok = leaves["ok"].reshape(cands.shape)
+            assert ok[cands >= 0].all() and not ok[cands < 0].any()
+            assert leaves["legal"].shape == (16 * 6, A.NUM_ACTIONS)
+            rolled += int((cands > 0).sum())
+            # Both wait for one decision: the look-ahead's clock, elixir, hand and
+            # cycle are then the real ones (the units need not be: see search.rs).
+            waited = envs[0].search(list(range(16)), np.zeros((16, 1), dtype=np.int64), DT)
+            acts[:] = 0
+        obs = [env.step(acts) for env in envs]
+        for key in OBS_KEYS:
+            assert np.array_equal(obs[0][key], obs[1][key]), (step, key)
+        if step % 8 == 7:
+            live = ~obs[0]["done"]
+            for key in ("global", "hand", "own_deck", "deck_extras", "extras", "legal"):
+                assert np.allclose(waited[key][live], obs[0][key][live], atol=1e-5), (step, key)
+            same += int(live.sum())
+    assert rolled > 150 and same > 150
+
+
+def test_client_look_ahead_equals_bridge_look_ahead():
+    """The tournament client rolls out the same positions to the same rows."""
+    cr_sim = pytest.importorskip("cr_sim")
+    rng = np.random.default_rng(1)
+    deck0, deck1 = SPECIAL[1]
+    env = cfbot_arena.VecEnv(num_envs=1, workers=1, decision_ticks=DT, max_skip=0)
+    spec = env.spec()
+    env.queue_match(0, tokens(spec, deck0), tokens(spec, deck1), 77)
+    obs = env.reset()
+    battle = cr_sim.Battle()
+    battle.reset(77, deck0, deck1)
+    feats = [cfbot_arena.Featurizer(deck0, DT), cfbot_arena.Featurizer(deck1, DT)]
+    for seat in (0, 1):
+        feats[seat].update(battle.view(seat).observe())
+    compared = 0
+    for decision in range(400):
+        if decision % 10 == 9:
+            cands = candidates_of(obs, rng, 5)
+            ours = env.search([0, 1], cands, 30)
+            for seat in (0, 1):
+                theirs = feats[seat].search(cands[seat].tolist(), 30)
+                rows = slice(seat * 5, seat * 5 + 5)
+                assert np.array_equal(ours["ok"][rows], theirs["ok"])
+                width = min(ours["entities"].shape[1], theirs["entities"].shape[1])
+                for key in POLICY_KEYS:
+                    mine, client = ours[key][rows], theirs[key]
+                    if key in ("entities", "entity_extras", "entity_mask"):
+                        assert not mine[:, width:].any() and not client[:, width:].any()
+                        mine, client = mine[:, :width], client[:, :width]
+                    assert np.array_equal(mine[theirs["ok"]], client[theirs["ok"]]), (decision, seat, key)
+                compared += int(theirs["ok"].sum())
+        acts = random_actions(obs, rng, 0.3)
+        sent = [feats[seat].act(int(acts[seat])) for seat in (0, 1)]
+        obs = env.step(acts)
+        out = 0
+        for tick in range(DT):
+            out = battle.step(sent[0] if tick == 0 else None, sent[1] if tick == 0 else None)
+            for seat in (0, 1):
+                feats[seat].update(battle.view(seat).observe())
+            if out:
+                break
+        if out:
+            break
+    assert compared > 100
+
+
+def test_searcher_chooses_offered_moves():
+    from cfbot.config import ModelConfig
+    from cfbot.model import Policy
+    from cfbot.search import Searcher
+
+    env = make_env(8, simulator="arena", seed=2)
+    obs = env.reset()
+    model = Policy(env.spec, ModelConfig()).eval()
+    rows = np.arange(env.rows)
+    for scope in ("tile", "all"):
+        searcher = Searcher(model, scope=scope, cells=3, horizon=12, weight=10.0, seed=1)
+        for _ in range(6):
+            flat = searcher.act(obs, lambda picked, cands: env.env.search(rows[picked].tolist(), cands, 12))
+            assert obs["legal"].bool().gather(1, flat.view(-1, 1)).all()
+            obs, _ = env.step(flat)
+        assert searcher.decisions > 0
