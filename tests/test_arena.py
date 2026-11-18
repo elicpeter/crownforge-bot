@@ -176,6 +176,65 @@ def test_learner_takes_the_focus_seat(tmp_path):
         assert (collector.learner_side == env.focus_seat).all()
 
 
+def test_exploiter_starts_from_weights_and_faces_the_focus_decks(tmp_path):
+    """An exploiter probe: a new run that starts from saved weights, plays one
+    frozen policy in every battle and leaves the focus decks to it."""
+    import dataclasses
+    import subprocess
+    import sys
+
+    from cfbot.config import ModelConfig, TrainConfig
+    from cfbot.league import League
+    from cfbot.model import Policy
+    from cfbot.rollout import Collector
+
+    focus, mine = ARENA_ARCHETYPES["guide_example"], ARENA_ARCHETYPES["starter"]
+    config = TrainConfig(run_dir=str(tmp_path / "probe"), simulator="arena", num_envs=24, rollout_steps=40,
+                         device="cpu", focus_to_opponent=True, deck_pool=[mine],
+                         model=ModelConfig(d_model=32, n_heads=2, d_card=16, d_board=16, d_trunk=32,
+                                           d_critic=16, critic_hidden=32))
+    env = make_env(config.num_envs, simulator="arena", seed=4, max_skip=config.max_skip,
+                   deck_pool=[mine], pool_prob=1.0)
+    env.set_focus([focus], 1.0)
+    torch.manual_seed(3)
+    frozen = Policy(env.spec, config.model)
+    weights = str(tmp_path / "frozen.pt")
+    torch.save({"model": frozen.state_dict(), "config": dataclasses.asdict(config)}, weights)
+    config.fixed_opponent = weights
+    collector = Collector(config, env, Policy(env.spec, config.model),
+                          League(config, env.spec, torch.device("cpu")), seed=4)
+    assert (collector.opponent == 1).all()
+    for _ in range(3):
+        _, stats = collector.collect(0, 0.0)
+        assert (env.focus_seat >= 0).all() and (collector.learner_side == 1 - env.focus_seat).all()
+    # The learner's seat holds the pool deck in every battle, the other seat the focus deck.
+    decks = env.last_cpu["own_deck"][:, :, 0].numpy().astype(int).reshape(config.num_envs, 2, 8)
+    rows = np.arange(config.num_envs)
+    assert (np.sort(decks[rows, collector.learner_side], -1) == np.sort(tokens(env.spec, mine))).all()
+    assert (np.sort(decks[rows, env.focus_seat], -1) == np.sort(tokens(env.spec, focus))).all()
+
+    # The training command: a new run begins with the saved weights, and a resumed one keeps its own.
+    run = str(tmp_path / "run")
+    command = [sys.executable, "-m", "cfbot.train", "--run", run, "--preset", "small", "--iters", "1",
+               "--set", "simulator=arena", "--set", "num_envs=8", "--set", "rollout_steps=16",
+               "--set", "minibatch=64", "--set", 'device="cpu"', "--set", "workers=2", "--set", "gauntlet_frac=0",
+               "--set", "lr=0", "--set", "lr_final=0", "--set", "ema_decay=0"]
+    # Another seed, so the probe's own random weights would differ from these.
+    plain = subprocess.run(command + ["--set", "seed=5"], capture_output=True, text=True)
+    assert plain.returncode == 0, plain.stderr[-2000:]
+    saved = torch.load(f"{run}/checkpoint.pt", map_location="cpu", weights_only=False)["model"]
+    probe = str(tmp_path / "probe-run")
+    command[command.index(run)] = probe
+    started = subprocess.run(command + ["--set", f"init_weights={run}/checkpoint.pt",
+                                        "--set", f"fixed_opponent={run}/checkpoint.pt"],
+                             capture_output=True, text=True)
+    assert started.returncode == 0 and "starting from the weights" in started.stdout, started.stderr[-2000:]
+    after = torch.load(f"{probe}/checkpoint.pt", map_location="cpu", weights_only=False)["model"]
+    assert all(torch.equal(saved[name], after[name]) for name in saved)
+    record = open(f"{probe}/metrics.jsonl").read()
+    assert '"snapshots": 0' in record
+
+
 def parity_game(deck0, deck1, seed, rng, play_prob):
     """One battle in the bridge and the same battle in the stock simulator,
     driven as the server drives it, with the client's featurizer per seat."""
@@ -385,6 +444,83 @@ def test_lane_bots_hold_the_pressure_decks(tmp_path):
     assert (collector.learner_side[collector.pressure] == 0).all()
     # The lane bots do put cards on the board with them.
     assert league.summary().get("win_lanerush") is not None
+
+
+def test_outside_opponents_join_the_league_with_their_decks(tmp_path):
+    """Frozen policies from outside the run: a share of the battles each, on
+    their own decks, results in the log, and a changed file loaded again."""
+    import dataclasses
+    import json
+    import os
+
+    from cfbot.config import ModelConfig, TrainConfig
+    from cfbot.league import League
+    from cfbot.model import Policy
+    from cfbot.rollout import Collector
+
+    small = ModelConfig(d_model=32, n_heads=2, d_card=16, d_board=16, d_trunk=32, d_critic=16, critic_hidden=32)
+    env = make_env(32, simulator="arena", seed=4, max_skip=8, deck_pool=list(ARENA_POOL.values()), pool_prob=0.3)
+    theirs = {"alpha": [ARENA_POOL["three_musketeers"]], "beta": [ARENA_POOL["mega_knight"]]}
+    entries = []
+    for seed, (name, decks) in enumerate(theirs.items()):
+        torch.manual_seed(40 + seed)
+        path = str(tmp_path / f"{name}.pt")
+        # One a bare snapshot, the other a training checkpoint.
+        weights = Policy(env.spec, small).state_dict()
+        torch.save(weights if seed else {"model": weights}, path)
+        entries.append({"name": name, "path": path, "decks": decks, "learner_focus": 1.0})
+    focus = ARENA_ARCHETYPES["guide_example"]
+    config = TrainConfig(run_dir=str(tmp_path), simulator="arena", num_envs=32, rollout_steps=64, device="cpu",
+                         baseline_frac=0.0, baseline_frac_final=0.0, focus_decks=[focus], focus_prob=0.0,
+                         outside_opponents=entries, outside_frac=0.5, model=small)
+    # The setting survives the config file a resumed run reads.
+    assert TrainConfig.from_dict(json.loads(config.to_json())).outside_opponents == entries
+    league = League(config, env.spec, torch.device("cpu"))
+    first = league.num_slots + len(league.baselines) + 1
+    layout = league.layout(0.0, 32)
+    assert layout.count(first) == 8 and layout.count(first + 1) == 8 and layout.count(0) == 16
+    assert not league.is_baseline(first) and league.is_outside(first) and not league.is_outside(first - 1)
+    assert league.module(first) is league.outside[0]["module"]
+
+    collector = Collector(config, env, Policy(env.spec, small), league, seed=4)
+    assert collector.pressure.sum() == 16
+    for _ in range(8):
+        collector.collect(0, 0.0)
+    decks = collector.obs_cpu["own_deck"][:, :, 0].long().view(32, 2, 8)
+    mine = sorted(card_ids(env.spec, focus))
+    for offset, name in enumerate(theirs):
+        rows = np.nonzero(collector.opponent == first + offset)[0]
+        wanted = sorted(card_ids(env.spec, theirs[name][0]))
+        # After the game that was running when it was assigned, the opponent
+        # holds its own deck and the learner, in the first seat, a focus deck.
+        assert np.mean([sorted(decks[i, 1].tolist()) == wanted for i in rows]) > 0.8
+        assert np.mean([sorted(decks[i, 0].tolist()) == mine for i in rows]) > 0.8
+        assert (collector.learner_side[rows] == 0).all()
+        assert league.summary().get(f"win_{name}") is not None
+    saved = league.state_dict()["outside_stats"]
+    assert saved["alpha"]["games"] > 0
+
+    # Nothing changed on disk: nothing is loaded. A new file is; a broken one is not.
+    assert league.refresh_outside() == []
+    torch.manual_seed(99)
+    fresh = Policy(env.spec, small).state_dict()
+    torch.save(fresh, entries[0]["path"])
+    os.utime(entries[0]["path"], (1_900_000_000, 1_900_000_000))
+    assert league.refresh_outside() == [first]
+    assert all(torch.equal(fresh[key], value) for key, value in league.outside[0]["module"].state_dict().items())
+    with open(entries[1]["path"], "wb") as handle:
+        handle.write(b"half a file")
+    os.utime(entries[1]["path"], (1_900_000_001, 1_900_000_001))
+    before = {key: value.clone() for key, value in league.outside[1]["module"].state_dict().items()}
+    assert league.refresh_outside() == []
+    assert all(torch.equal(before[key], value) for key, value in league.outside[1]["module"].state_dict().items())
+
+    # A resumed league keeps the results; a league without the setting is as before.
+    again = League(dataclasses.replace(config, outside_opponents=[entries[0]]), env.spec, torch.device("cpu"))
+    again.load_state_dict(league.state_dict())
+    assert again.outside[0]["games"] == league.outside[0]["games"]
+    plain = League(dataclasses.replace(config, outside_opponents=None), env.spec, torch.device("cpu"))
+    assert plain.outside == [] and first not in plain.layout(0.0, 32)
 
 
 def test_make_env_and_scripted_bots():

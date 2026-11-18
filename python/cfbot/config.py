@@ -198,6 +198,25 @@ class TrainConfig:
     # Train only against this checkpoint (an exploiter probe): no self-play,
     # no scripted bots, no snapshots.
     fixed_opponent: str | None = None
+    # Start a new run from these weights (a checkpoint or a bare snapshot)
+    # instead of from random ones. A resumed run ignores it.
+    init_weights: str | None = None
+    # Arena only. In league battles the focus decks go to the opponent and the
+    # learner takes the other seat: an exploiter probe plays its own decks
+    # against a frozen policy on the decks that policy trained with.
+    focus_to_opponent: bool = False
+    # Arena only. Frozen policies from outside this run that join the league's
+    # opponents, each a dict: "name" (for the log), "path" (a checkpoint or a
+    # bare snapshot of a network with this run's model settings), "decks" (the
+    # decks it holds) and optionally "learner_focus" (the chance the learner
+    # holds a focus deck against it; focus_prob if absent). Together they take
+    # outside_frac of the battles, shared equally, out of self-play's share. As
+    # against the lane-pressure bots, the learner sits in the first seat with a
+    # focus, pool or random deck. A file that changes on disk is loaded again
+    # at the next league refresh, so a newer copy can be dropped in while the
+    # run goes on.
+    outside_opponents: list[dict] | None = None
+    outside_frac: float = 0.0
 
     # Schedule. Progress runs from 0 to 1 and drives every schedule above. With
     # budget_hours it is elapsed training time over the budget, and the run

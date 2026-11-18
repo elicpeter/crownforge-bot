@@ -155,6 +155,10 @@ def main() -> None:
             raise SystemExit("focus_decks needs the arena simulator")
         env.set_focus(config.focus_decks, config.focus_prob)
     model = Policy(spec, config.model).to(device)
+    if config.init_weights and data is None:
+        weights = torch.load(config.init_weights, map_location="cpu", weights_only=False)
+        model.load_state_dict(weights["model"] if "model" in weights else weights)
+        print(f"starting from the weights in {config.init_weights}")
     optimizer = make_optimizer(model, config)
     league = League(config, spec, device)
     ema = Ema(model, config.ema_decay) if config.ema_decay > 0 else None
@@ -207,6 +211,8 @@ def main() -> None:
         if iteration % config.league_refresh_iters == 0:
             if league.snapshots:
                 collector.taint(league.refresh_slots())
+            if league.outside:
+                collector.taint(league.refresh_outside())
             collector.relayout(progress)
         shaping = config.shaping_coef * max(0.0, 1 - progress / max(1e-9, config.shaping_anneal_frac))
         pool_prob, mutant_prob = deck_mix(config, progress)

@@ -80,16 +80,20 @@ class Collector:
         self.learner_side = self.rng.integers(2, size=env.num_envs)
         focus = getattr(env, "focus_seat", None)
         if focus is not None:
-            # Arena only: a battle that holds a focus deck has the learner on that seat.
-            self.learner_side = np.where(focus >= 0, focus, self.learner_side).astype(np.int64)
+            # Arena only: a battle that holds a focus deck has the learner on that
+            # seat, or on the other one when the focus decks are the opponent's.
+            seat = 1 - focus if config.focus_to_opponent else focus
+            self.learner_side = np.where(focus >= 0, seat, self.learner_side).astype(np.int64)
         # Games whose opponent changed mid-game do not count for ratings.
         self.tainted = np.zeros(env.num_envs, dtype=bool)
-        # Battles against a lane-pressure bot that holds a chosen deck (arena).
+        # Battles against an opponent that holds a chosen deck (arena): a
+        # lane-pressure bot, or a frozen policy from outside the run.
         self.pressure = np.zeros(env.num_envs, dtype=bool)
         self.pressure_decks: list[list[int]] = []
-        if config.pressure_decks:
+        self.outside_decks = [[card_ids(env.spec, deck) for deck in entry["decks"]] for entry in league.outside]
+        if config.pressure_decks or league.outside:
             self.deck_rng = np.random.default_rng(seed + 23)
-            self.pressure_decks = [card_ids(env.spec, deck) for deck in config.pressure_decks]
+            self.pressure_decks = [card_ids(env.spec, deck) for deck in config.pressure_decks or []]
             self.focus_decks = [card_ids(env.spec, deck) for deck in config.focus_decks or []]
             self.pool_decks = [card_ids(env.spec, deck)
                                for deck in resolve_pool(config.deck_pool, env.spec.get("simulator")) or []]
@@ -101,8 +105,10 @@ class Collector:
         layout = np.asarray(self.league.layout(progress, self.env.num_envs), dtype=np.int64)
         self.tainted |= layout != self.opponent
         self.opponent = layout
-        if self.pressure_decks:
-            lane = np.array([self.league.is_baseline(o) and isinstance(self.league.baseline(o), LaneBot)
+        if self.pressure_decks or self.outside_decks:
+            league = self.league
+            lane = np.array([(bool(self.pressure_decks) and league.is_baseline(o)
+                              and isinstance(league.baseline(o), LaneBot)) or league.is_outside(o)
                              for o in layout.tolist()])
             for index in np.nonzero(lane & ~self.pressure)[0]:
                 self._queue_pressure(int(index))
@@ -110,16 +116,26 @@ class Collector:
 
     def _queue_pressure(self, index: int) -> None:
         """Set up battle ``index``'s next game: the learner in the first seat
-        with a focus, pool or random deck, the lane bot with a pressure deck."""
+        with a focus, pool or random deck, the lane bot with a pressure deck or
+        the outside opponent with one of its own."""
         rng = self.deck_rng
         draw = rng.random()
-        if self.focus_decks and draw < self.config.focus_prob:
+        opponent = int(self.opponent[index])
+        outside = self.league.is_outside(opponent)
+        focus_prob = self.config.focus_prob
+        their_decks = self.pressure_decks
+        if outside:
+            entry = self.league.outside_of(opponent)
+            their_decks = self.outside_decks[self.league.outside.index(entry)]
+            if entry["learner_focus"] is not None:
+                focus_prob = entry["learner_focus"]
+        if self.focus_decks and draw < focus_prob:
             mine = self.focus_decks[rng.integers(len(self.focus_decks))]
         elif self.pool_decks and rng.random() < 0.5:
             mine = self.pool_decks[rng.integers(len(self.pool_decks))]
         else:
             mine = self.env.random_decks(1, int(rng.integers(1 << 31)))[0]
-        theirs = self.pressure_decks[rng.integers(len(self.pressure_decks))]
+        theirs = their_decks[rng.integers(len(their_decks))]
         self.learner_side[index] = 0
         self.env.queue_match(index, list(mine), list(theirs))
 
@@ -208,7 +224,7 @@ class Collector:
                     torch.rand((len(idx), A.NUM_TYPES), device=device),
                     torch.rand((len(idx), A.CELLS), device=device),
                 )
-                groups.append((idx, idx, self.league.slot_modules[opponent - 1], noise))
+                groups.append((idx, idx, self.league.module(opponent), noise))
 
             actions = torch.zeros(rows, dtype=torch.int64)
             if groups:
@@ -320,10 +336,12 @@ class Collector:
                     self.deck_stats.record(info["decks"][index], float(info["reward"][index * 2]))
                 self.learner_side[index] = self.rng.integers(2)
                 # The episode that has just started may hold a focus deck on one
-                # seat (arena only): the learner takes that seat.
+                # seat (arena only): the learner takes that seat, or the other
+                # one when the focus decks are the opponent's.
                 focus = getattr(self.env, "focus_seat", None)
                 if focus is not None and focus[index] >= 0:
-                    self.learner_side[index] = int(focus[index])
+                    seat = int(focus[index])
+                    self.learner_side[index] = 1 - seat if self.config.focus_to_opponent else seat
                 if self.pressure[index]:
                     # The game that has just started is the one queued last
                     # time, learner first; line up the one after it.

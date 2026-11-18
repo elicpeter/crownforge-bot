@@ -9,7 +9,8 @@ The learner plays three kinds of opponents:
 * scripted baselines, mostly early on.
 
 Opponent ids used by the collector: 0 is the learner itself, ``1..K`` are
-snapshot slots, and the rest are baselines.
+snapshot slots, then come the baselines, and after them any frozen policies
+from outside the run (``outside_opponents``).
 
 ``lineage_elo`` rates the learner against frozen copies of its own past
 rating. It shows whether the learner keeps beating its history; it cannot tell
@@ -57,6 +58,19 @@ class League:
             for parameter in module.parameters():
                 parameter.requires_grad_(False)
             self.slot_modules = [module] + [None] * (config.league_slots - 1)
+        # Frozen policies from outside the run: name, path, decks, the loaded
+        # network, the file's modification time and decayed results.
+        self.outside: list[dict] = []
+        if config.outside_opponents and config.outside_frac > 0 and not self.fixed:
+            for entry in config.outside_opponents:
+                module = Policy(spec, config.model).to(device)
+                module.eval()
+                for parameter in module.parameters():
+                    parameter.requires_grad_(False)
+                self.outside.append({"name": entry["name"], "path": entry["path"], "decks": entry["decks"],
+                                     "learner_focus": entry.get("learner_focus"), "module": module,
+                                     "mtime": None, "games": 0.0, "score": 0.0})
+            self.refresh_outside(strict=True)
 
     # ------------------------------------------------------------- opponents
 
@@ -69,10 +83,47 @@ class League:
         return bool(self.config.fixed_opponent)
 
     def is_baseline(self, opponent: int) -> bool:
-        return opponent > self.num_slots
+        return self.num_slots < opponent <= self.num_slots + len(self.baselines)
 
     def baseline(self, opponent: int):
         return self.baselines[opponent - self.num_slots - 1]
+
+    def is_outside(self, opponent: int) -> bool:
+        return opponent > self.num_slots + len(self.baselines)
+
+    def outside_of(self, opponent: int) -> dict:
+        return self.outside[opponent - self.num_slots - len(self.baselines) - 1]
+
+    def module(self, opponent: int) -> Policy:
+        """The frozen network behind a snapshot slot or an outside opponent."""
+        if self.is_outside(opponent):
+            return self.outside_of(opponent)["module"]
+        return self.slot_modules[opponent - 1]
+
+    def refresh_outside(self, strict: bool = False) -> list[int]:
+        """Load every outside opponent whose file is new or has changed.
+        Returns the opponent ids that changed, so games in progress against
+        them can be ignored. A file that cannot be read keeps the weights
+        already loaded (it may be half copied), unless ``strict``."""
+        changed = []
+        for index, entry in enumerate(self.outside):
+            try:
+                mtime = os.path.getmtime(entry["path"])
+                if mtime == entry["mtime"]:
+                    continue
+                data = torch.load(entry["path"], map_location=self.device, weights_only=False)
+                entry["module"].load_state_dict(data["model"] if "model" in data else data)
+            except Exception as error:
+                if strict:
+                    raise
+                print(f"league: outside opponent {entry['name']} not reloaded from {entry['path']}: {error}",
+                      flush=True)
+                continue
+            if entry["mtime"] is not None:
+                print(f"league: outside opponent {entry['name']} reloaded from {entry['path']}", flush=True)
+            entry["mtime"] = mtime
+            changed.append(self.num_slots + len(self.baselines) + 1 + index)
+        return changed
 
     def baseline_frac(self, progress: float) -> float:
         c = self.config
@@ -100,6 +151,10 @@ class League:
             layout += [self.num_slots + 1 + index] * per_baseline
         for slot in loaded:
             layout += [slot + 1] * per_slot
+        if self.outside:
+            per_outside = int(num_envs * c.outside_frac / len(self.outside))
+            for index in range(len(self.outside)):
+                layout += [self.num_slots + len(self.baselines) + 1 + index] * per_outside
         layout = layout[:num_envs]
         return layout + [0] * (num_envs - len(layout))
 
@@ -210,6 +265,11 @@ class League:
             stats["games"] = stats["games"] * 0.995 + 1.0
             stats["score"] = stats["score"] * 0.995 + score
             return
+        if self.is_outside(opponent):
+            stats = self.outside_of(opponent)
+            stats["games"] = stats["games"] * 0.995 + 1.0
+            stats["score"] = stats["score"] * 0.995 + score
+            return
         if self.fixed:
             self.fixed_stats["games"] = self.fixed_stats["games"] * 0.995 + 1.0
             self.fixed_stats["score"] = self.fixed_stats["score"] * 0.995 + score
@@ -231,6 +291,9 @@ class League:
                 out[key] = round(stats["score"] / stats["games"], 3)
         if self.fixed and self.fixed_stats["games"] >= 5:
             out["win_fixed"] = round(self.fixed_stats["score"] / self.fixed_stats["games"], 3)
+        for entry in self.outside:
+            if entry["games"] >= 5:
+                out[f"win_{entry['name']}"] = round(entry["score"] / entry["games"], 3)
         return out
 
     # ----------------------------------------------------------- persistence
@@ -244,6 +307,8 @@ class League:
             "baseline_stats": self.baseline_stats,
             "baseline_names": [baseline_label(bot) for bot in self.baselines],
             "fixed_stats": self.fixed_stats,
+            "outside_stats": {entry["name"]: {"games": entry["games"], "score": entry["score"]}
+                              for entry in self.outside},
             "elo": self.elo,
         }
 
@@ -271,6 +336,8 @@ class League:
         old = dict(zip(names, state["baseline_stats"]))
         self.baseline_stats = [old.get(baseline_label(bot), {"games": 0.0, "score": 0.0}) for bot in self.baselines]
         self.fixed_stats = state.get("fixed_stats", self.fixed_stats)
+        for entry in self.outside:
+            entry.update(state.get("outside_stats", {}).get(entry["name"], {}))
         self.elo = state["elo"]
         self.slot_snapshot = [None] * self.num_slots
         self.refresh_slots()
