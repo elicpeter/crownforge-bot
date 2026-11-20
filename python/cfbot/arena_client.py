@@ -56,6 +56,7 @@ class Player:
             self.searcher = Searcher(model, temperature=temperature, greedy=mode == "greedy", seed=seed, **search)
         self.decisions = 0
         self.policy_seconds = 0.0
+        self.slowest_seconds = 0.0
         self.failed = False
 
     def start(self) -> None:
@@ -70,12 +71,15 @@ class Player:
         rows = self.featurizer.observe()
         public = {key: torch.from_numpy(rows[key]).to(self.device) for key in POLICY_KEYS}
         if self.searcher is not None:
-            flat = int(self.searcher.act(public, self._rollouts)[0])
+            lines = (lambda picked, k: self.featurizer.search_open(k), self.featurizer.search_advance)
+            flat = int(self.searcher.act(public, self._rollouts, lines=lines)[0])
         else:
             flat = int(self.agent.act(public)[0])
         action = self.featurizer.act(flat)
         self.decisions += 1
-        self.policy_seconds += time.perf_counter() - started
+        spent = time.perf_counter() - started
+        self.policy_seconds += spent
+        self.slowest_seconds = max(self.slowest_seconds, spent)
         return list(action) if action else None
 
     def _rollouts(self, picked, candidates):
@@ -121,7 +125,10 @@ async def play(url: str, name: str, player: Player, log: str | None, matches: in
                 mean_ms = 1000 * player.policy_seconds / max(1, player.decisions)
                 print(f"  {message['result']} {message['crowns']} rating {message['rating']:.0f} "
                       f"({message['delta']:+.0f}) match {message['match']}: {ticks} ticks, {plays} plays, "
-                      f"{ignored} ignored, {mean_ms:.1f} ms per decision", flush=True)
+                      f"{ignored} ignored, {mean_ms:.1f} ms per decision, slowest so far "
+                      f"{1000 * player.slowest_seconds:.0f} ms"
+                      + (f", look-ahead cut short {player.searcher.cut_short} times" if player.searcher else ""),
+                      flush=True)
                 if log:
                     with open(log, "a") as handle:
                         handle.write(json.dumps({
@@ -160,7 +167,8 @@ def search_settings(text: str | None) -> dict | None:
     """``scope=tile,cells=4,horizon=40,weight=20`` as Searcher's keyword arguments."""
     if not text:
         return None
-    kinds = {"scope": str, "cells": int, "horizon": int, "weight": float, "wait_floor": lambda v: v == "1"}
+    kinds = {"scope": str, "cells": int, "horizon": int, "weight": float, "wait_floor": lambda v: v == "1",
+             "depth": int, "samples": int, "rollout_temperature": float, "budget": float}
     settings = {}
     for item in text.split(","):
         key, _, value = item.partition("=")
@@ -181,7 +189,9 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--ema", action="store_true", help="play the averaged weights")
     parser.add_argument("--search", default=None, metavar="SETTINGS",
-                        help="look ahead before moving (cfbot.search), e.g. scope=tile,cells=4,horizon=40,weight=20")
+                        help="look ahead before moving (cfbot.search), e.g. scope=tile,cells=4,horizon=40,weight=20; "
+                             "depth=5 lets both players go on playing in the look-ahead, budget=0.8 stops a "
+                             "decision's look-ahead after that many seconds")
     parser.add_argument("--seed", type=int, default=int(time.time()))
     parser.add_argument("--matches", type=int, default=None, help="stop after this many matches")
     parser.add_argument("--log", default=None, help="append one JSON line per match here")

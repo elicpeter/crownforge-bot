@@ -104,7 +104,8 @@ class Player:
         if self.searcher is not None:
             where = rows.cpu().numpy()
             return self.searcher.act(
-                obs, lambda picked, candidates: env.env.search(where[picked].tolist(), candidates, self.searcher.horizon)
+                obs, lambda picked, candidates: env.env.search(where[picked].tolist(), candidates, self.searcher.horizon),
+                lines=(lambda picked, k: env.env.search_open(where[picked].tolist(), k), env.env.search_advance),
             )
         return self.bot.act(obs) if self.bot is not None else self.agent.act(obs)
 

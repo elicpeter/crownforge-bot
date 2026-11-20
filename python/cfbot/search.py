@@ -23,10 +23,28 @@ Two ways of choosing candidates:
     leans towards playing; ``wait_floor`` scores a wait at no less than the
     value of the current position.
 
+With ``depth`` above zero nobody sits still in a rollout: after the candidate
+both players go on choosing moves from the policy, each from what it would
+see, for ``depth`` decisions (``depth * decision_ticks`` ticks), and ``Q`` is
+the value of the position reached. ``horizon`` is then not used. The opponent
+there holds the cards it has shown, filled up with a guess, and the same
+network plays it. ``samples`` such lines are played per candidate and
+averaged. All candidates of one decision share their random draws, so two
+candidates differ by what the moves change and not by luck. A wait is then
+just a wait of one decision, and ``wait_floor`` does not apply.
+
+``budget`` (seconds, with ``depth``) is for a client that must answer in time:
+once a decision has taken that long, its lines stop where they are and are
+valued there, so a slow decision looks less far ahead instead of arriving late.
+The first decision of every line is always played. Off by default, and of no
+use on a batch of battles, where one clock would cut all of them short.
+
 What a rollout does not know is listed in ``arena/src/search.rs``.
 """
 
 from __future__ import annotations
+
+import time
 
 import numpy as np
 import torch
@@ -37,6 +55,8 @@ from .env import POLICY_KEYS
 # Rows the value head sees per call are padded to a multiple of this, so MPS
 # and CUDA meet only a few batch shapes.
 BUCKET = 64
+# Rows the policy sees per call inside a rollout, at most.
+CHUNK = 2048
 
 
 class Searcher:
@@ -46,15 +66,29 @@ class Searcher:
     indices into the rows of ``obs`` and ``candidates`` an int64 array
     ``[len(picked), k]`` of flat action indices (-1 for none); it returns the
     bridge's dict of leaf planes, ``[len(picked) * k, ...]``.
+
+    With ``depth`` above zero ``act`` needs ``lines`` instead, a pair
+    ``(open, advance)``: ``open(picked, k)`` starts ``k`` lines for each picked
+    row and ``advance(actions)`` plays one decision in all of them
+    (``VecEnv.search_open`` and ``search_advance``).
     """
 
     def __init__(self, model, scope: str = "tile", cells: int = 4, horizon: int = 40, weight: float = 20.0,
-                 temperature: float = 1.0, greedy: bool = False, wait_floor: bool = True, seed: int = 0):
+                 temperature: float = 1.0, greedy: bool = False, wait_floor: bool = True, seed: int = 0,
+                 depth: int = 0, samples: int = 1, rollout_temperature: float = 1.0,
+                 budget: float | None = None):
         if scope not in ("tile", "all"):
             raise ValueError("scope must be 'tile' or 'all'")
+        if depth < 0 or samples < 1:
+            raise ValueError("depth must be at least 0 and samples at least 1")
         self.model = model.eval()
         self.scope, self.cells, self.horizon, self.weight = scope, cells, horizon, weight
         self.temperature, self.greedy, self.wait_floor = temperature, greedy, wait_floor
+        self.depth, self.samples, self.rollout_temperature = depth, samples, rollout_temperature
+        self.budget = budget
+        # Decisions whose lines the budget stopped early, and the depth they reached in all.
+        self.cut_short = 0
+        self.depth_reached = 0
         self.generator = torch.Generator().manual_seed(seed)
         self.decisions = 0
         self.changed = 0
@@ -119,10 +153,56 @@ class Searcher:
         value = torch.where(ended, result, value)
         return torch.where(torch.from_numpy(leaves["ok"]).to(device), value, torch.full_like(value, float("-inf")))
 
+    # -- lines in which both players move ------------------------------------
+
+    def _play_out(self, picked: torch.Tensor, cand: torch.Tensor, lines) -> torch.Tensor:
+        """The value of every candidate, ``[n, k]``, after ``depth`` decisions in
+        which both players follow the policy."""
+        open_lines, advance = lines
+        device = next(self.model.parameters()).device
+        n, k = cand.shape
+        s = self.samples
+        count = n * k * s
+        started = time.perf_counter()
+        state = open_lines(picked.cpu().numpy(), k * s)
+        first = cand.repeat_interleave(s, dim=1).reshape(count).cpu()
+        for step in range(self.depth):
+            if step and self.budget is not None and time.perf_counter() - started > self.budget:
+                self.cut_short += n
+                break
+            self.depth_reached += n
+            need = torch.from_numpy(state["live"]).view(count, 1) & torch.from_numpy(state["choice"]).view(count, 2)
+            actions = torch.zeros(count, 2, dtype=torch.int64)
+            if step == 0:
+                # The viewer's first move is the candidate itself.
+                need[:, 0] = False
+                actions[:, 0] = first
+            rows = torch.nonzero(need.view(-1)).squeeze(-1)
+            if rows.numel():
+                # One draw per decision, sample and seat, shared by its k candidates.
+                kinds = torch.rand(n, 1, s, 2, 11, generator=self.generator).expand(n, k, s, 2, 11).reshape(count * 2, 11)
+                cells = torch.rand(n, 1, s, 2, A.CELLS, generator=self.generator).expand(n, k, s, 2, A.CELLS)
+                cells = cells.reshape(count * 2, A.CELLS)
+                flat = actions.view(-1)
+                for start in range(0, rows.numel(), CHUNK):
+                    part = rows[start : start + CHUNK]
+                    padded = part if device.type == "cpu" else torch.cat(
+                        [part, part[:1].expand(-len(part) % BUCKET)])
+                    public = {key: torch.from_numpy(state[key])[padded].to(device) for key in POLICY_KEYS}
+                    chosen = self.model.act(
+                        public, temperature=self.rollout_temperature, with_value=False,
+                        noise=(kinds[padded].to(device), cells[padded].to(device)),
+                    )["flat"]
+                    flat[part] = chosen[: len(part)].cpu()
+            state = advance(actions.numpy())
+        leaves = {key: state[key][0::2] for key in POLICY_KEYS}
+        leaves.update(ok=state["ok"], ended=state["ended"], result=state["result"])
+        return self._values(leaves).view(n, k, s).mean(-1)
+
     # -- acting ------------------------------------------------------------
 
     @torch.no_grad()
-    def act(self, obs: dict[str, torch.Tensor], rollouts) -> torch.Tensor:
+    def act(self, obs: dict[str, torch.Tensor], rollouts, lines=None) -> torch.Tensor:
         public = {key: obs[key] for key in POLICY_KEYS}
         logp, root = self.model.full_log_probs(public)
         index, prior = self._candidates(logp)
@@ -132,10 +212,15 @@ class Searcher:
         if picked.numel() == 0:
             return first
         cand = index[picked]
-        leaves = rollouts(picked.cpu().numpy(), cand.cpu().numpy().astype(np.int64))
-        q = self._values(leaves).view(cand.shape)
-        if self.scope == "all" and self.wait_floor:
-            q[:, 0] = torch.maximum(q[:, 0], root[picked])
+        if self.depth > 0:
+            if lines is None:
+                raise ValueError("depth above zero needs lines=(open, advance)")
+            q = self._play_out(picked, cand, lines)
+        else:
+            leaves = rollouts(picked.cpu().numpy(), cand.cpu().numpy().astype(np.int64))
+            q = self._values(leaves).view(cand.shape)
+            if self.scope == "all" and self.wait_floor:
+                q[:, 0] = torch.maximum(q[:, 0], root[picked])
         q = torch.where(cand >= 0, q, torch.full_like(q, float("-inf")))
         score = prior[picked] + self.weight * q
         # A candidate the rollout could not play keeps the policy from choosing it at all.

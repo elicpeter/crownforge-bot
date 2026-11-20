@@ -91,8 +91,9 @@ fn unit(meta: &Meta, e: &view::Ent, tracker: &Tracker, tick: i64) -> Entity {
 }
 
 /// Make `eng` agree with `view`, the viewer in seat 0. Returns the hand cards
-/// that went in as another card, `(what the engine holds, the card it is)`.
-pub fn rebuild(meta: &Meta, view: &View, tracker: &Tracker, eng: &mut Engine) -> Vec<(usize, usize)> {
+/// that went in as another card, `(what the engine holds, the card it is)`,
+/// and the deck the opponent was given.
+pub fn rebuild(meta: &Meta, view: &View, tracker: &Tracker, eng: &mut Engine) -> (Vec<(usize, usize)>, Vec<usize>) {
     let lib = &meta.lib;
     // The viewer's cards in the order they will come: hand, next, the rest.
     // The engine keeps its evolution counters and the card Mirror copies to
@@ -115,14 +116,17 @@ pub fn rebuild(meta: &Meta, view: &View, tracker: &Tracker, eng: &mut Engine) ->
         .collect();
     own.push(view.next);
     own.extend(tracker.rest_of_cycle(view));
-    // The opponent plays nothing in a rollout; its deck only has to be a deck.
+    // The opponent's deck: the cards it has shown, filled up with this side's
+    // own and then any others. A guess, and all a rollout has.
     let mut other: Vec<usize> = tracker.reveals.iter().map(|reveal| reveal.card).collect();
     other.truncate(8);
     for &card in tracker.deck.iter().chain(lib.deployable.iter()) {
         if other.len() == 8 {
             break;
         }
-        if !other.contains(&card) && !lib.defs[card].is_champion {
+        // No champion (two ability slots a side) and no Mirror (the engine
+        // would not know what it copies) among the cards made up.
+        if !other.contains(&card) && !lib.defs[card].is_champion && !lib.defs[card].is_mirror {
             other.push(card);
         }
     }
@@ -132,7 +136,11 @@ pub fn rebuild(meta: &Meta, view: &View, tracker: &Tracker, eng: &mut Engine) ->
     if own.len() == 8 {
         eng.queue[0] = own;
     }
-    eng.queue[1] = other;
+    // In its queue the cards it has never shown come first, then the ones it
+    // played longest ago: the four it played last cannot be in its hand.
+    let mut queue = other.clone();
+    queue.sort_by_key(|&card| tracker.reveals.iter().find(|reveal| reveal.card == card).map_or(0, |reveal| reveal.last_play));
+    eng.queue[1] = queue;
 
     // Towers: the reset put all six up, ids 1-3 the viewer's and 4-6 the other's.
     let mut down = [0i32; 2];
@@ -161,7 +169,7 @@ pub fn rebuild(meta: &Meta, view: &View, tracker: &Tracker, eng: &mut Engine) ->
     for e in view.ents.iter().filter(|e| !e.tower) {
         eng.entities.push(unit(meta, e, tracker, view.tick));
     }
-    swapped
+    (swapped, other)
 }
 
 /// The view of seat 0 of a rebuilt engine, under the ids and card names the tracker knows.
@@ -193,7 +201,7 @@ pub fn rollout(
     decision_ticks: u32,
     rows: &mut Rows,
 ) -> Leaf {
-    let swapped = rebuild(meta, view, tracker, eng);
+    let (swapped, _) = rebuild(meta, view, tracker, eng);
     let mut tracker = tracker.clone();
     let mut first = Action::noop();
     if let Some((slot, x, y)) = action {
@@ -228,6 +236,134 @@ pub fn rollout(
     }
     feat::featurize(meta, scratch, &tracker, rows);
     leaf
+}
+
+/// One imagined continuation in which both players go on playing: an engine
+/// rebuilt from a view, the viewer's tracker in seat 0 and in seat 1 the one
+/// its opponent might hold (`Tracker::across`). Whoever drives it chooses both
+/// seats' moves from the rows it hands out, one decision interval at a time.
+///
+/// On top of what a rebuilt engine does not know (see the top of this file),
+/// the opponent here holds a guessed deck in a guessed order and has its
+/// elixir from the tracker's estimate, which is an upper bound.
+pub struct Line {
+    eng: Engine,
+    trackers: [Tracker; 2],
+    views: [View; 2],
+    swapped: Vec<(usize, usize)>,
+    pub leaf: Leaf,
+    /// Still being played: opened, its first move carried out, not ended.
+    pub live: bool,
+    /// Its first move has gone in.
+    pub moved: bool,
+}
+
+impl Line {
+    pub fn new(meta: &Meta) -> Line {
+        Line {
+            eng: Engine::new(meta.lib.clone()),
+            trackers: [Tracker::new(meta, [0; 8]), Tracker::new(meta, [0; 8])],
+            views: [View::default(), View::default()],
+            swapped: Vec::new(),
+            leaf: Leaf::default(),
+            live: false,
+            moved: false,
+        }
+    }
+
+    /// Start from the position `view` shows. `rows` receives both seats'
+    /// observations there, the viewer's first.
+    pub fn open(&mut self, meta: &Meta, view: &View, tracker: &Tracker, decision_ticks: u32, rows: &mut [Rows]) {
+        self.live = false;
+        self.moved = false;
+        self.leaf = Leaf::default();
+        let (swapped, other) = rebuild(meta, view, tracker, &mut self.eng);
+        self.swapped = swapped;
+        self.trackers[0] = tracker.clone();
+        let mut deck = [0; 8];
+        deck.copy_from_slice(&other[..8]);
+        self.trackers[1] = tracker.across(meta, view, deck, crate::arena::HEIGHT.to_f64() as f32);
+        look(&self.eng, &self.swapped, &mut self.views[0]);
+        view::from_engine(&self.eng, 1, &mut self.views[1]);
+        self.trackers[1].update(meta, &self.views[1], i64::from(decision_ticks));
+        for seat in 0..2 {
+            feat::featurize(meta, &self.views[seat], &self.trackers[seat], &mut rows[seat]);
+        }
+        self.live = true;
+    }
+
+    /// One decision interval; the moves go in on its first tick. A move is the
+    /// engine's action and what that seat's tracker should remember of it
+    /// (`None` waits). The first call's seat-0 move is the candidate this line
+    /// stands for: if the engine refuses it the line ends, not ok.
+    pub fn advance(
+        &mut self,
+        meta: &Meta,
+        moves: [Option<(Action, (i32, f32, f32))>; 2],
+        decision_ticks: u32,
+        rows: &mut [Rows],
+    ) {
+        if !self.live {
+            return;
+        }
+        let first = !self.moved;
+        self.moved = true;
+        let mut acts = [Action::noop(); 2];
+        for seat in 0..2 {
+            let Some((action, (slot, x, y))) = moves[seat] else { continue };
+            acts[seat] = action;
+            self.trackers[seat].note_action(slot, x, y);
+            if seat == 0 && (0..4).contains(&slot) {
+                // A Mirror that went in as the card it copies costs one more.
+                let held = self.eng.hand(0)[slot as usize];
+                let mirror = self.swapped.iter().any(|&(stands_in, real)| stands_in == held && meta.lib.defs[real].is_mirror);
+                if mirror {
+                    self.eng.elixir[0] = self.eng.elixir[0] - Fx::from_int(1);
+                }
+            }
+        }
+        if first {
+            self.leaf.ok = moves[0].is_none();
+        }
+        for step in 0..decision_ticks.max(1) {
+            let outcome = self.eng.step(if step == 0 { acts } else { [Action::noop(); 2] });
+            look(&self.eng, &self.swapped, &mut self.views[0]);
+            view::from_engine(&self.eng, 1, &mut self.views[1]);
+            if step == 0 && first && moves[0].is_some() {
+                self.leaf.ok = self.views[0].last_action == view::ACT_OK;
+                if !self.leaf.ok {
+                    self.live = false;
+                    return;
+                }
+            }
+            for seat in 0..2 {
+                self.trackers[seat].update(meta, &self.views[seat], i64::from(decision_ticks));
+            }
+            if outcome != Outcome::Running {
+                self.live = false;
+                self.leaf.done = true;
+                self.leaf.result = match outcome {
+                    Outcome::Win0 => 1.0,
+                    Outcome::Win1 => -1.0,
+                    _ => 0.0,
+                };
+                break;
+            }
+        }
+        for seat in 0..2 {
+            feat::featurize(meta, &self.views[seat], &self.trackers[seat], &mut rows[seat]);
+        }
+    }
+
+    /// End the line as not ok, with a fresh engine: after a panic, or for a candidate that is no move.
+    pub fn fail(&mut self, meta: &Meta, fresh: bool) {
+        if fresh {
+            self.eng = Engine::new(meta.lib.clone());
+        }
+        self.live = false;
+        self.moved = true;
+        self.leaf = Leaf::default();
+    }
 }
 
 /// A flat action index as a rollout's move. `None` if it is no action at all.

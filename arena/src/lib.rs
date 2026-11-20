@@ -579,6 +579,78 @@ fn roll_candidates(
     }
 }
 
+/// Look-ahead lines in which both players move, kept between calls. Row
+/// `line * 2 + seat` of the planes written out is that seat's observation.
+#[derive(Default)]
+struct Lines {
+    lines: Vec<search::Line>,
+    rows: Vec<Rows>,
+    open: usize,
+}
+
+impl Lines {
+    fn reserve(&mut self, meta: &Meta, count: usize, max_entities: usize) {
+        while self.lines.len() < count {
+            self.lines.push(search::Line::new(meta));
+        }
+        while self.rows.len() < count * 2 {
+            self.rows.push(Rows::new(max_entities));
+        }
+        self.open = count;
+    }
+
+    /// Both seats' rows of every open line, with `live` (still being played),
+    /// `ok` (the line's first move was carried out), `ended` and `result`
+    /// (+1 the viewer won, -1 lost) per line. A line that is not live keeps the
+    /// rows it had when it stopped.
+    fn write<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        let all: Vec<&Rows> = self.rows[..self.open * 2].iter().collect();
+        write_rows(py, &d, &all, false)?;
+        let lines = &self.lines[..self.open];
+        d.set_item("live", lines.iter().map(|line| line.live).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item("ok", lines.iter().map(|line| line.leaf.ok).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item("ended", lines.iter().map(|line| line.leaf.done).collect::<Vec<_>>().into_pyarray(py))?;
+        d.set_item("result", lines.iter().map(|line| line.leaf.result).collect::<Vec<_>>().into_pyarray(py))?;
+        Ok(d)
+    }
+}
+
+/// Start `line` from what one player sees. An engine panic ends it, not ok.
+fn open_line(meta: &Meta, view: &View, tracker: &Tracker, decision_ticks: u32, line: &mut search::Line, rows: &mut [Rows]) {
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        line.open(meta, view, tracker, decision_ticks, rows);
+    }));
+    if opened.is_err() {
+        line.fail(meta, true);
+    }
+}
+
+/// Play one decision interval of `line`. `indices` are the two seats' flat
+/// actions, each in its own frame; anything that is no action waits, except as
+/// the viewer's first move, where it ends the line as not ok.
+fn advance_line(meta: &Meta, decision_ticks: u32, line: &mut search::Line, rows: &mut [Rows], indices: [i64; 2]) {
+    if !line.live {
+        return;
+    }
+    let mut moves = [None; 2];
+    for seat in 0..2 {
+        if indices[seat] != 0 {
+            moves[seat] = decode(indices[seat], seat);
+        }
+    }
+    if !line.moved && indices[0] != 0 && moves[0].is_none() {
+        line.fail(meta, false);
+        return;
+    }
+    let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        line.advance(meta, moves, decision_ticks, rows);
+    }));
+    if stepped.is_err() {
+        line.fail(meta, true);
+    }
+}
+
 #[pyclass]
 struct VecEnv {
     context: Context,
@@ -587,6 +659,7 @@ struct VecEnv {
     max_entities: usize,
     /// Rows the look-ahead writes into, kept between calls.
     leaf_rows: Vec<Rows>,
+    lines: Lines,
 }
 
 #[pymethods]
@@ -646,7 +719,7 @@ impl VecEnv {
             master_seed: seed,
         };
         let slots = (0..num_envs).map(|index| Slot::new(&context, index, max_entities)).collect();
-        Ok(Self { context, pool, slots, max_entities, leaf_rows: Vec::new() })
+        Ok(Self { context, pool, slots, max_entities, leaf_rows: Vec::new(), lines: Lines::default() })
     }
 
     #[getter]
@@ -861,6 +934,74 @@ impl VecEnv {
         write_leaves(py, &self.leaf_rows[..n * k], &leaves)
     }
 
+    /// Open look-ahead lines in which both players move: `k` for each row of
+    /// `rows` (`env * 2 + seat`), each an engine rebuilt from what that player
+    /// sees, with that player in seat 0 and a guessed opponent in seat 1 (see
+    /// `search::Line`). Returns both seats' observation rows at the start,
+    /// `[len(rows) * k * 2, ...]` with row `line * 2 + seat`, and `live`, `ok`,
+    /// `ended`, `result` per line. Lines stay open until the next call of this
+    /// method. The battles themselves are not touched.
+    fn search_open<'py>(&mut self, py: Python<'py>, rows: Vec<usize>, k: usize) -> PyResult<Bound<'py, PyDict>> {
+        if rows.is_empty() || k == 0 {
+            return Err(PyValueError::new_err("rows and k must be at least 1"));
+        }
+        if rows.iter().any(|&row| row >= self.slots.len() * 2) {
+            return Err(PyValueError::new_err("row out of range"));
+        }
+        let count = rows.len() * k;
+        self.lines.reserve(&self.context.meta, count, self.max_entities);
+        let context = &self.context;
+        let slots = &self.slots;
+        let lines = &mut self.lines.lines[..count];
+        let out = &mut self.lines.rows[..count * 2];
+        py.detach(|| {
+            self.pool.install(|| {
+                lines.par_chunks_mut(k).zip(out.par_chunks_mut(k * 2)).zip(rows.par_iter()).for_each(
+                    |((lines, out), &row)| {
+                        let (slot, seat) = (&slots[row / 2], row % 2);
+                        for (line, out) in lines.iter_mut().zip(out.chunks_mut(2)) {
+                            open_line(
+                                &context.meta, &slot.views[seat], &slot.trackers[seat], context.decision_ticks, line, out,
+                            );
+                        }
+                    },
+                );
+            });
+        });
+        self.lines.write(py)
+    }
+
+    /// Play one decision interval in every open line. `actions` is
+    /// `[lines, 2]`: the viewer's and the opponent's flat action, each in its
+    /// own frame, 0 to wait. The first call's viewer column is the candidate
+    /// each line stands for (below 0: none, the line ends not ok). Returns what
+    /// `search_open` returns, one decision later.
+    fn search_advance<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: PyReadonlyArray2<'py, i64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let actions = actions.as_array();
+        let count = self.lines.open;
+        if actions.dim() != (count, 2) || count == 0 {
+            return Err(PyValueError::new_err("actions must be [open lines, 2]"));
+        }
+        let flat: Vec<i64> = actions.iter().copied().collect();
+        let context = &self.context;
+        let lines = &mut self.lines.lines[..count];
+        let out = &mut self.lines.rows[..count * 2];
+        py.detach(|| {
+            self.pool.install(|| {
+                lines.par_iter_mut().zip(out.par_chunks_mut(2)).zip(flat.par_chunks(2)).for_each(
+                    |((line, out), indices)| {
+                        advance_line(&context.meta, context.decision_ticks, line, out, [indices[0], indices[1]]);
+                    },
+                );
+            });
+        });
+        self.lines.write(py)
+    }
+
     /// The sampler never draws a deck the engine refuses.
     fn deck_retries(&self) -> u64 {
         0
@@ -925,6 +1066,7 @@ struct Featurizer {
     engine: Engine,
     scratch: View,
     leaf_rows: Vec<Rows>,
+    lines: Lines,
 }
 
 impl Featurizer {
@@ -960,6 +1102,7 @@ impl Featurizer {
             engine: Engine::new(Library::default_lib()),
             scratch: View::default(),
             leaf_rows: Vec::new(),
+            lines: Lines::default(),
         })
     }
 
@@ -1044,6 +1187,38 @@ impl Featurizer {
             self.decision_ticks, &mut self.leaf_rows[..candidates.len()], &mut leaves,
         );
         write_leaves(py, &self.leaf_rows[..candidates.len()], &leaves)
+    }
+
+    /// Open `k` look-ahead lines in which both players move, from the latest
+    /// observation, as `VecEnv.search_open` does for one row.
+    fn search_open<'py>(&mut self, py: Python<'py>, k: usize) -> PyResult<Bound<'py, PyDict>> {
+        if k == 0 {
+            return Err(PyValueError::new_err("k must be at least 1"));
+        }
+        self.lines.reserve(&self.meta, k, self.max_entities);
+        for (line, out) in self.lines.lines[..k].iter_mut().zip(self.lines.rows[..k * 2].chunks_mut(2)) {
+            open_line(&self.meta, &self.view, &self.tracker, self.decision_ticks, line, out);
+        }
+        self.lines.write(py)
+    }
+
+    /// Play one decision interval in every open line, as `VecEnv.search_advance` does.
+    fn search_advance<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: PyReadonlyArray2<'py, i64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let actions = actions.as_array();
+        let count = self.lines.open;
+        if actions.dim() != (count, 2) || count == 0 {
+            return Err(PyValueError::new_err("actions must be [open lines, 2]"));
+        }
+        for ((line, out), indices) in
+            self.lines.lines[..count].iter_mut().zip(self.lines.rows[..count * 2].chunks_mut(2)).zip(actions.outer_iter())
+        {
+            advance_line(&self.meta, self.decision_ticks, line, out, [indices[0], indices[1]]);
+        }
+        self.lines.write(py)
     }
 
     /// The server action for flat action `index`, `[slot, x, y]`, or `None` to

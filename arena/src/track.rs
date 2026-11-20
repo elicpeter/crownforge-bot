@@ -257,6 +257,39 @@ impl Tracker {
         rest.into_iter().map(|entry| entry.1).collect()
     }
 
+    /// The tracker the opponent might be holding, as far as this side can tell,
+    /// for a look-ahead in which the opponent moves too. Its deck is `deck` (a
+    /// guess beyond the cards it has shown), its plays are the ones this side
+    /// saw, and it has seen every card this side played. `height` turns a tile
+    /// into its frame. Units start there with no age and no speed.
+    pub fn across(&self, meta: &Meta, view: &View, deck: [usize; 8], height: f32) -> Tracker {
+        let mut other = Tracker::new(meta, deck);
+        other.plays = self.opp_plays;
+        let mut latest = 0;
+        for (index, &card) in deck.iter().enumerate() {
+            if let Some(seen) = self.reveals.iter().find(|reveal| reveal.card == card) {
+                other.last_play[index] = seen.last_play;
+                if seen.last_play > latest && !meta.lib.defs[card].is_mirror {
+                    latest = seen.last_play;
+                    other.last_played = Some(card);
+                }
+            }
+        }
+        other.opp_plays = self.plays;
+        other.opp_elixir = view.elixir;
+        let mut shown: Vec<(u32, usize)> =
+            (0..8).filter(|&index| self.last_play[index] != 0).map(|index| (self.last_play[index], self.deck[index])).collect();
+        shown.sort_unstable();
+        for (last_play, card) in shown {
+            let last_tick = self.history.iter().rev().find(|play| play.mine && play.card == card).map_or(0, |play| play.tick + 1);
+            other.reveals.push(Reveal { card, last_tick, count: 1, last_play });
+        }
+        for play in &self.history {
+            other.history.push_back(Play { mine: !play.mine, y: height - play.y, ..*play });
+        }
+        other
+    }
+
     /// Plays by this side since deck slot `index` was last played.
     pub fn plays_since(&self, index: usize) -> Option<u32> {
         (self.last_play[index] != 0).then(|| self.plays - self.last_play[index])

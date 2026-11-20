@@ -606,7 +606,7 @@ def test_look_ahead_plays_what_is_offered_and_leaves_the_battles_alone():
 def test_client_look_ahead_equals_bridge_look_ahead():
     """The tournament client rolls out the same positions to the same rows."""
     cr_sim = pytest.importorskip("cr_sim")
-    rng = np.random.default_rng(1)
+    rng, line_rng = np.random.default_rng(1), np.random.default_rng(2)
     deck0, deck1 = SPECIAL[1]
     env = cfbot_arena.VecEnv(num_envs=1, workers=1, decision_ticks=DT, max_skip=0)
     spec = env.spec()
@@ -617,7 +617,7 @@ def test_client_look_ahead_equals_bridge_look_ahead():
     feats = [cfbot_arena.Featurizer(deck0, DT), cfbot_arena.Featurizer(deck1, DT)]
     for seat in (0, 1):
         feats[seat].update(battle.view(seat).observe())
-    compared = 0
+    compared = lined = 0
     for decision in range(400):
         if decision % 10 == 9:
             cands = candidates_of(obs, rng, 5)
@@ -634,6 +634,31 @@ def test_client_look_ahead_equals_bridge_look_ahead():
                         mine, client = mine[:, :width], client[:, :width]
                     assert np.array_equal(mine[theirs["ok"]], client[theirs["ok"]]), (decision, seat, key)
                 compared += int(theirs["ok"].sum())
+            # Lines in which both players move: the same rows from the client, for both seats.
+            k = 3
+            opened = env.search_open([0, 1], k)
+            moves = np.zeros((2 * k, 2), dtype=np.int64)
+            moves[:, 0] = cands[:, :k].reshape(-1)
+            for line in range(2 * k):
+                options = np.flatnonzero(opened["legal"][line * 2 + 1][1:]) + 1
+                if line % k and len(options):
+                    moves[line, 1] = line_rng.choice(options)
+            ours = [opened, env.search_advance(moves), env.search_advance(np.zeros_like(moves))]
+            for seat in (0, 1):
+                part = moves[seat * k : seat * k + k]
+                theirs = [feats[seat].search_open(k), feats[seat].search_advance(part),
+                          feats[seat].search_advance(np.zeros_like(part))]
+                for mine, client in zip(ours, theirs):
+                    lines = slice(seat * k, seat * k + k)
+                    for key in ("live", "ok", "ended", "result"):
+                        assert np.array_equal(mine[key][lines], client[key]), (decision, seat, key)
+                    width = min(mine["entities"].shape[1], client["entities"].shape[1])
+                    for key in POLICY_KEYS:
+                        a, b = mine[key][seat * k * 2 : seat * k * 2 + k * 2], client[key]
+                        if key in ("entities", "entity_extras", "entity_mask"):
+                            a, b = a[:, :width], b[:, :width]
+                        assert np.array_equal(a, b), (decision, seat, key)
+                    lined += k
         acts = random_actions(obs, rng, 0.3)
         sent = [feats[seat].act(int(acts[seat])) for seat in (0, 1)]
         obs = env.step(acts)
@@ -646,7 +671,7 @@ def test_client_look_ahead_equals_bridge_look_ahead():
                 break
         if out:
             break
-    assert compared > 100
+    assert compared > 100 and lined > 300
 
 
 def test_searcher_chooses_offered_moves():
@@ -665,3 +690,83 @@ def test_searcher_chooses_offered_moves():
             assert obs["legal"].bool().gather(1, flat.view(-1, 1)).all()
             obs, _ = env.step(flat)
         assert searcher.decisions > 0
+
+
+def test_lines_in_which_both_players_move():
+    """A line in which both wait gives the viewer the rows of the rollout nobody
+    plays in; where the opponent plays a card it pays for it; a candidate that
+    is no move ends its line; the battles are left alone."""
+    rng = np.random.default_rng(3)
+    envs = [cfbot_arena.VecEnv(num_envs=8, workers=2, seed=9, max_skip=0) for _ in range(2)]
+    obs = [env.reset() for env in envs]
+    rows = list(range(16))
+    same = paid = 0
+    for step in range(120):
+        if step % 8 == 7:
+            start = envs[0].search_open(rows, 3)
+            assert start["legal"].shape == (16 * 3 * 2, A.NUM_ACTIONS) and start["live"].all()
+            # Per row: line 0 both wait, line 1 the opponent plays something it may,
+            # line 2 stands for a candidate that is no move.
+            moves = np.zeros((48, 2), dtype=np.int64)
+            theirs = start["legal"].reshape(16, 3, 2, -1)[:, 1, 1]
+            for row in range(16):
+                options = np.flatnonzero(theirs[row][1:]) + 1
+                if len(options):
+                    moves[row * 3 + 1, 1] = rng.choice(options)
+            moves[2::3, 0] = -1
+            after = envs[0].search_advance(moves)
+            ok, live = after["ok"].reshape(16, 3), after["live"].reshape(16, 3)
+            assert ok[:, :2].all() and not ok[:, 2].any() and not live[:, 2].any()
+            old = envs[0].search(rows, np.zeros((16, 1), dtype=np.int64), DT)
+            width = min(after["entities"].shape[1], old["entities"].shape[1])
+            for key in POLICY_KEYS:
+                new, ref = after[key][0::6], old[key]
+                if key in ("entities", "entity_extras", "entity_mask"):
+                    assert not new[:, width:].any() and not ref[:, width:].any()
+                    new, ref = new[:, :width], ref[:, :width]
+                assert np.array_equal(new, ref), (step, key)
+            same += 16
+            elixir = after["global"][1::2, 1].reshape(16, 3)
+            played = moves[1::3, 1] > 0
+            assert (elixir[played, 1] < elixir[played, 0]).all()
+            paid += int(played.sum())
+            later = envs[0].search_advance(np.zeros((48, 2), dtype=np.int64))
+            assert (later["global"][0::2, 0] >= after["global"][0::2, 0]).all()
+            assert not later["live"].reshape(16, 3)[:, 2].any()
+        acts = random_actions(obs[0], rng, 0.25)
+        obs = [env.step(acts) for env in envs]
+        for key in OBS_KEYS:
+            assert np.array_equal(obs[0][key], obs[1][key]), (step, key)
+    assert same > 150 and paid > 100
+
+
+def test_searcher_plays_both_sides_out():
+    from cfbot.config import ModelConfig
+    from cfbot.model import Policy
+    from cfbot.search import Searcher
+
+    env = make_env(8, simulator="arena", seed=2)
+    obs = env.reset()
+    model = Policy(env.spec, ModelConfig()).eval()
+    rows = np.arange(env.rows)
+    lines = (lambda picked, k: env.env.search_open(rows[picked].tolist(), k), env.env.search_advance)
+    for scope in ("tile", "all"):
+        searcher = Searcher(model, scope=scope, cells=2, weight=10.0, seed=1, depth=3, samples=2)
+        for _ in range(5):
+            flat = searcher.act(obs, None, lines=lines)
+            assert obs["legal"].bool().gather(1, flat.view(-1, 1)).all()
+            obs, _ = env.step(flat)
+        assert searcher.decisions > 0
+    with pytest.raises(ValueError):
+        Searcher(model, depth=2, seed=1).act(env.reset(), None)
+    # A budget that is spent at once stops every line after its first decision; the move is still legal.
+    obs = env.reset()
+    hurried = Searcher(model, scope="all", cells=2, weight=10.0, seed=1, depth=6, budget=0.0)
+    for _ in range(4):
+        flat = hurried.act(obs, None, lines=lines)
+        assert obs["legal"].bool().gather(1, flat.view(-1, 1)).all()
+        obs, _ = env.step(flat)
+    assert hurried.decisions > 0 and hurried.cut_short == hurried.decisions == hurried.depth_reached
+    patient = Searcher(model, scope="all", cells=2, weight=10.0, seed=1, depth=3, budget=60.0)
+    patient.act(obs, None, lines=lines)
+    assert patient.cut_short == 0 and patient.depth_reached == 3 * patient.decisions
