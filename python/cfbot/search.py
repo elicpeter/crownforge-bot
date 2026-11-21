@@ -34,9 +34,11 @@ candidates differ by what the moves change and not by luck. A wait is then
 just a wait of one decision, and ``wait_floor`` does not apply.
 
 ``budget`` (seconds, with ``depth``) is for a client that must answer in time:
-once a decision has taken that long, its lines stop where they are and are
-valued there, so a slow decision looks less far ahead instead of arriving late.
-The first decision of every line is always played. Off by default, and of no
+a decision's lines stop where they are, and are valued there, as soon as
+another step as long as its longest so far would take it past the budget. A
+slow decision then looks less far ahead instead of arriving late. The first
+decision of every line is always played, so the budget is a target and not a
+guarantee: leave room below the server's limit. Off by default, and of no
 use on a batch of battles, where one clock would cut all of them short.
 
 What a rollout does not know is listed in ``arena/src/search.rs``.
@@ -166,8 +168,11 @@ class Searcher:
         started = time.perf_counter()
         state = open_lines(picked.cpu().numpy(), k * s)
         first = cand.repeat_interleave(s, dim=1).reshape(count).cpu()
+        longest, mark = 0.0, started
         for step in range(self.depth):
-            if step and self.budget is not None and time.perf_counter() - started > self.budget:
+            now = time.perf_counter()
+            longest, mark = max(longest, now - mark), now
+            if step and self.budget is not None and now - started + longest > self.budget:
                 self.cut_short += n
                 break
             self.depth_reached += n

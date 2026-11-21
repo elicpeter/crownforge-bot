@@ -631,6 +631,15 @@ the candidates. Training does not change; this is a setting of the client.
   chooses among that card's `cells` most likely tiles.
 - `scope=all`: waiting, every playable card's best tiles and the ability are
   compared.
+- `depth=N` (with either scope): both players go on playing in each try. After
+  the candidate the policy chooses moves for both sides, each from what that
+  side would see, for `N` decisions, and the value head scores the position
+  reached; `horizon` is then not used. `rollout_temperature` below 1 makes the
+  imagined players less random, `samples` averages several tries per
+  candidate, and `budget=SECONDS` stops a decision's look-ahead in time for a
+  server that waits only so long. What was measured with it, and the setting
+  the tournament entry uses, is in
+  [docs/arena-tournament-entry.md](docs/arena-tournament-entry.md).
 
 The engine is nearly deterministic (its random numbers go to the deck shuffle
 and to scatter such as Graveyard's), which is what makes a rollout worth
@@ -642,8 +651,8 @@ both players waiting, clock, elixir, hand and cycle are exact and the unit rows
 are identical in 45% of positions. Every candidate is rolled out under the same
 omissions, so the comparison is fairer than any one rollout is accurate.
 
-Measured on an M2 Max with the iteration-3850 snapshot of the long run, the
-look-ahead side on the eight focus decks, the same snapshot sampling on pool
+Without `depth`, measured on an M2 Max with the iteration-3850 snapshot of the
+long run, the look-ahead side on the eight focus decks, the same snapshot sampling on pool
 decks, 512 games a row, two seeds:
 
 | first side | seed 781 | seed 912 |
