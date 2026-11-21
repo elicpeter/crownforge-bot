@@ -639,7 +639,9 @@ the candidates. Training does not change; this is a setting of the client.
   candidate, and `budget=SECONDS` stops a decision's look-ahead in time for a
   server that waits only so long. What was measured with it, and the setting
   the tournament entry uses, is in
-  [docs/arena-tournament-entry.md](docs/arena-tournament-entry.md).
+  [docs/arena-tournament-entry.md](docs/arena-tournament-entry.md). The steps
+  to enter with that setting are in
+  [docs/arena-how-to-enter.md](docs/arena-how-to-enter.md).
 
 The engine is nearly deterministic (its random numbers go to the deck shuffle
 and to scatter such as Graveyard's), which is what makes a rollout worth

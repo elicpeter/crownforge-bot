@@ -24,13 +24,16 @@ python -m cfbot.arena_client wss://HOST NAME \
     --search scope=all,cells=1,weight=40,depth=5,rollout_temperature=0.5,budget=0.6
 ```
 
+The steps from an empty folder to a playing client, with the newest weights of
+the GitHub release, are in [arena-how-to-enter.md](arena-how-to-enter.md).
+
 A bare snapshot is loaded with the run's `config.json` two directories above
 it. `--device cuda` makes the look-ahead faster where there is a GPU. Run the
 client alone on its machine: see "Time per move" below.
 
 The look-ahead setting above scored best over 1,536 games; two others were
-within the error of it. It also gains against the counter policies, which
-are different bots from the one it imagines, but it has not met another
+within the error of it. It also gains against the newest counter policies,
+which are different bots from the one it imagines, but it has not met another
 team's bot (see "Not verified").
 
 ## How the deck was chosen
@@ -206,24 +209,30 @@ and costs about 40% more time per move. More weight than 40 does worse.
 ### Against other opponents
 
 The same snapshot on deck 1, without look-ahead and with the entry's setting,
-against opponents that are not the bot the look-ahead imagines. 512 games a
-cell, the same games in both cells of a row, none crashed. The counters are
+against opponents that are not the bot the look-ahead imagines. Sets of 512
+games, the same games in both cells of a row, none crashed. The counters are
 policies trained from the run's weights to beat it: c on the eight focus
 decks, a on four decks built to attack it, b on the pool decks. "Final" are
 their last weights, which this snapshot had never played.
 
-| opponent | without | with look-ahead | gain |
-|---|---|---|---|
-| counter c, final | 0.352 | 0.506 | +0.154 |
-| counter c, the copy the run trained against | 0.494 | 0.664 | +0.170 |
-| counter a, final | 0.666 | 0.700 | +0.034 |
-| counter b, final | 0.816 | 0.852 | +0.035 |
-| iteration 12000 of the run | 0.902 | 0.904 | +0.002 |
+| opponent | games | without | with look-ahead | gain |
+|---|---|---|---|---|
+| counter c, final | 1,024 | 0.354 | 0.505 | +0.151 |
+| counter c, the copy the run trained against | 512 | 0.494 | 0.664 | +0.170 |
+| counter a, final | 1,024 | 0.658 | 0.716 | +0.058 |
+| counter a, the copy the run trained against | 512 | 0.850 | 0.820 | -0.029 |
+| counter b, final | 512 | 0.816 | 0.852 | +0.035 |
+| iteration 12000 of the run | 1,024 | 0.890 | 0.896 | +0.007 |
+| iteration 8000 of the run | 512 | 0.945 | 0.958 | +0.013 |
 
-The look-ahead did not lose ground against any of them. It gains most where
-the snapshot is weakest, against the policy specialised in the mirror, and
-nothing where the snapshot already wins nine games in ten. Second sets of
-games for three of these rows were still being played when this was written.
+By set, for the rows of two sets: counter c final +0.154 and +0.147, counter a
+final +0.034 and +0.082, iteration 12000 +0.002 and +0.012.
+
+The look-ahead gains most where the snapshot is weakest, against the policy
+specialised in the mirror, and next to nothing where the snapshot already
+wins nine games in ten. In one row it scored lower, against the older counter
+a; that difference and the gains against counter b and the two earlier
+iterations are each inside the error of their match.
 
 In these matches the look-ahead changed about 2% of the decisions.
 
