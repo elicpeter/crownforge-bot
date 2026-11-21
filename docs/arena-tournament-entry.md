@@ -28,9 +28,10 @@ A bare snapshot is loaded with the run's `config.json` two directories above
 it. `--device cuda` makes the look-ahead faster where there is a GPU. Run the
 client alone on its machine: see "Time per move" below.
 
-The look-ahead setting above is the best one measured so far. Others were
-level with it within the error, and none has yet been played against a bot
-other than the run's own (see "Not verified").
+The look-ahead setting above scored best over 1,536 games; two others were
+within the error of it. It also gains against the counter policies, which
+are different bots from the one it imagines, but it has not met another
+team's bot (see "Not verified").
 
 ## How the deck was chosen
 
@@ -177,11 +178,52 @@ for every setting. All settings are `scope=all,cells=1`.
 | `weight=40,depth=5,rollout_temperature=0.5` | 0.761 | +0.124 |
 | `weight=20,depth=5,rollout_temperature=0.5` | 0.766 | +0.129 |
 
-Four settings are level at about 0.76 and cannot be told apart at this size.
-`weight=40,depth=5,rollout_temperature=0.5` was played again on two more sets
-of games, each with its own baseline: 0.761, 0.779 and 0.750, together 0.763
-over 1,536 games against 0.648 without look-ahead, a gain of 0.115. Reruns of
-the other leaders were still being played when this was written.
+Later additions on the same games: `weight=40,depth=7` 0.766,
+`weight=40,depth=7,rollout_temperature=0.5` 0.767,
+`weight=40,depth=5,rollout_temperature=0.25` 0.754,
+`weight=20,depth=5,rollout_temperature=0.25` 0.736,
+`weight=40,depth=3,rollout_temperature=0.5` 0.723 and `weight=80,depth=5`
+0.660.
+
+Several settings are level at about 0.76 and cannot be told apart at this
+size, so five were played again on two more sets of games, each set with its
+own baseline (0.637, 0.671 and 0.637 without look-ahead, 0.648 together).
+1,536 games per setting:
+
+| setting | the three sets | together | gain |
+|---|---|---|---|
+| `weight=40,depth=5,rollout_temperature=0.5` | 0.761 0.779 0.750 | 0.763 | +0.115 |
+| `weight=40,depth=5` | 0.758 0.763 0.738 | 0.753 | +0.105 |
+| `weight=20,depth=7` | 0.760 0.748 0.732 | 0.747 | +0.099 |
+| `weight=20,depth=5,rollout_temperature=0.5` | 0.766 0.738 0.705 | 0.736 | +0.088 |
+| `weight=20,depth=5` | 0.693 0.715 0.715 | 0.708 | +0.060 |
+
+Each row is ±0.025. The first is the entry's setting: best together, and no
+dearer per move than the others at `depth=5`. Looking further ahead did not
+add to it (`depth=7` with `weight=40`: 0.766 against 0.758 on the same games)
+and costs about 40% more time per move. More weight than 40 does worse.
+
+### Against other opponents
+
+The same snapshot on deck 1, without look-ahead and with the entry's setting,
+against opponents that are not the bot the look-ahead imagines. 512 games a
+cell, the same games in both cells of a row, none crashed. The counters are
+policies trained from the run's weights to beat it: c on the eight focus
+decks, a on four decks built to attack it, b on the pool decks. "Final" are
+their last weights, which this snapshot had never played.
+
+| opponent | without | with look-ahead | gain |
+|---|---|---|---|
+| counter c, final | 0.352 | 0.506 | +0.154 |
+| counter c, the copy the run trained against | 0.494 | 0.664 | +0.170 |
+| counter a, final | 0.666 | 0.700 | +0.034 |
+| counter b, final | 0.816 | 0.852 | +0.035 |
+| iteration 12000 of the run | 0.902 | 0.904 | +0.002 |
+
+The look-ahead did not lose ground against any of them. It gains most where
+the snapshot is weakest, against the policy specialised in the mirror, and
+nothing where the snapshot already wins nine games in ten. Second sets of
+games for three of these rows were still being played when this was written.
 
 In these matches the look-ahead changed about 2% of the decisions.
 
@@ -214,11 +256,10 @@ client is stronger.
 - **No match against another team's bot.** Every number here is the run
   against itself, earlier versions of itself, or counter policies started
   from its own weights.
-- **Look-ahead against a different opponent.** All look-ahead results are
-  against the same network without look-ahead. The opponent a try imagines
-  is that network, so the gain may be smaller against a bot that plays
-  differently. Matches against the counter policies and older snapshots were
-  planned and had not finished.
+- **Look-ahead against a bot of another kind.** The opponent a try imagines
+  is the run's own network. The gain held against the counter policies, but
+  those started from the run's weights too; a bot trained elsewhere may be
+  read worse.
 - **The final snapshot.** Ratings stop at the label 17700; the run went on
   after it.
 - **The tournament's own settings**: its move timeout and the commit of the
