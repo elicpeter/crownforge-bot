@@ -10,13 +10,19 @@ found so far. Why these were chosen, and what was measured, is in
 | | |
 |---|---|
 | deck | `executioner,archers,dart_goblin,zap,goblins,royal_ghost,mighty_miner,elixir_golem` |
-| weights | `arena-it17700.pt`, the newest file in the GitHub release `arena-weights-2026-11-17` |
+| weights | the snapshot with the highest iteration number in the GitHub release `arena-weights-2026-11-17` |
 | play | sampled (the default), with look-ahead |
 | look-ahead | `scope=all,cells=1,weight=40,depth=5,rollout_temperature=0.5,budget=0.6` |
 
-If the release has a snapshot with a higher number by the time you read this,
-use that one: the steps are the same, only the file name changes. The deck must
-stay this one. From iteration 16,868 on the run trained on this deck alone.
+Always take the newest snapshot, the `arena-itNNNNN.pt` with the highest
+number, whatever it is when you read this. Do not pick one by its rating: the
+newest ones have none in the release notes, because the run went on after the
+last rating was measured, and a missing rating is no reason to step back to an
+older file. Step 2 finds the file for you. When this was written it was
+`arena-it18800.pt`.
+
+The deck must stay this one. From iteration 16,868 on the run trained on this
+deck alone.
 
 ## Two things you must be given
 
@@ -47,18 +53,28 @@ commit of the simulator, set `ARENA_REV` to it before running the script.
 The repository and its release are private: `gh` must be logged in to an
 account that can read them.
 
+    SNAP=$(gh release view arena-weights-2026-11-17 --repo elicpeter/crownforge-bot --json assets \
+        -q '[.assets[].name | select(test("^arena-it[0-9]+\\.pt$"))] | sort | last')
+    echo "newest snapshot: $SNAP"
     mkdir -p weights/snapshots
     gh release download arena-weights-2026-11-17 --repo elicpeter/crownforge-bot \
-        -p arena-it17700.pt -p arena-run-config.json -p SHA256SUMS -D weights/snapshots
-    (cd weights/snapshots && grep -E 'arena-it17700.pt|arena-run-config.json' SHA256SUMS | shasum -a 256 -c -)
+        -p "$SNAP" -p arena-run-config.json -p SHA256SUMS -D weights/snapshots
+    (cd weights/snapshots && grep -E "$SNAP|arena-run-config.json" SHA256SUMS | shasum -a 256 -c -)
     mv weights/snapshots/arena-run-config.json weights/config.json
 
-Both files must say `OK`. The layout matters: a snapshot is a bare state dict,
-and the client reads the model's shape from a file named `config.json` one
-folder above the folder the snapshot is in.
+The first command sets `SNAP` to the snapshot with the highest iteration number
+(the names are padded to five digits, so they sort in order). The later steps
+use `$SNAP`: run them in the same shell, or put the file name in by hand. If
+you list the release yourself instead, the rule is the same: the highest
+number.
+
+Both files must say `OK` (on Linux without `shasum`, use `sha256sum -c -`).
+The layout matters: a snapshot is a bare state dict, and the client reads the
+model's shape from a file named `config.json` one folder above the folder the
+snapshot is in.
 
     weights/config.json
-    weights/snapshots/arena-it17700.pt
+    weights/snapshots/arena-itNNNNN.pt
 
 ## 3. Check it locally
 
@@ -68,14 +84,14 @@ A server on this machine and the simulator's own random player as the opponent:
     CR_ARENA_BIND=127.0.0.1:8765 cr-arena &
     python arena/cr-rl-arena/server/examples/random_agent.py ws://127.0.0.1:8765 example &
     python -m cfbot.arena_client ws://127.0.0.1:8765 check \
-        --checkpoint weights/snapshots/arena-it17700.pt \
+        --checkpoint weights/snapshots/$SNAP \
         --deck executioner,archers,dart_goblin,zap,goblins,royal_ghost,mighty_miner,elixir_golem \
         --search scope=all,cells=1,weight=40,depth=5,rollout_temperature=0.5,budget=0.6 \
         --matches 3
 
 Stop the two background processes afterwards. Each match prints one line. What
-it should look like (measured on 2026-11-20 with exactly these files, on a
-laptop CPU):
+it should look like (measured on 2026-11-20 with the snapshot of iteration
+17700, on a laptop CPU):
 
     win [3, 0] rating 1216 (+16) match 1: 581 ticks, 6 plays, 0 ignored, 147.1 ms per decision, slowest so far 227 ms, look-ahead cut short 0 times
 
@@ -89,7 +105,7 @@ Go on only if all of these hold:
 ## 4. Enter
 
     python -m cfbot.arena_client wss://HOST NAME \
-        --checkpoint weights/snapshots/arena-it17700.pt \
+        --checkpoint weights/snapshots/$SNAP \
         --deck executioner,archers,dart_goblin,zap,goblins,royal_ghost,mighty_miner,elixir_golem \
         --search scope=all,cells=1,weight=40,depth=5,rollout_temperature=0.5,budget=0.6 \
         --log matches.jsonl
@@ -124,7 +140,13 @@ connection drops. Stop it with Ctrl-C. `--matches N` stops it after N matches.
 - Steps 1 to 3 were run as written on 2026-11-20 in a fresh clone on macOS
   (Python 3.13, CPU): the build ended with `arena bridge ready`, both
   checksums said `OK`, and the three matches were three wins with 0 ignored
-  and a slowest decision of 251 ms. The Windows script was not run again.
+  and a slowest decision of 251 ms. Steps 2 and 3 were run again after the
+  release got `arena-it18800.pt`: step 2 found that file, and the result was
+  three wins, 0 ignored, slowest decision 336 ms. The Windows script was not
+  run again, and step 2 is written for a Unix shell.
+- The newest snapshots have no rating. `arena-it18800.pt` has only been checked
+  to load and to beat the random player; that it is stronger than
+  `arena-it17700.pt` is expected from the run's trend, not measured.
 - The time per move was measured on a laptop, not on the machine that will
   play.
 - Step 4 has only been run against a server on the same machine.
