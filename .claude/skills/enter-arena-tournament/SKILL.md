@@ -23,6 +23,10 @@ or new measurements arrive.
   release, whatever it is. A missing rating is no reason to take an older one.
 - Deck and look-ahead settings: exactly as in the file. Change a setting only
   for a reason the file gives (moves arriving late on this machine).
+- The tournament is a bracket the organiser starts by hand. After joining, the
+  client waits in a pool, possibly for a long time, printing nothing. That is
+  not a fault: do not restart it, and do not stop it until the tournament is
+  over. Confirm on `https://HOST/tournament` that the name is in the pool.
 - Run step 3 (the local check) on the machine that will play before step 4,
   and go on only if every one of its four conditions holds. Report the match
   lines to the user as printed.
