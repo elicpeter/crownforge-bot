@@ -6,6 +6,52 @@ battle simulator, with the self-play training system that produces it.
 The agent plays any deck against any deck. It sees only what a player sees and
 outputs one simulator action per decision.
 
+## Arena tournament entry: `ezgg`
+
+The bot this repository enters in the
+[cr-rl-arena](https://github.com/ilumn/cr-rl-arena) tournament. Whoever runs
+it, run it with exactly these four things. They are the best configuration
+measured, and each one matters:
+
+| | |
+|---|---|
+| name | `ezgg` |
+| weights | `arena-it24500.pt`, the newest snapshot in the release [`arena-weights-2026-11-17`](https://github.com/elicpeter/crownforge-bot/releases/tag/arena-weights-2026-11-17). Always the one with the highest number, not an older one. |
+| deck | `executioner,archers,dart_goblin,zap,goblins,royal_ghost,mighty_miner,elixir_golem` |
+| look-ahead | `--search scope=all,cells=1,weight=20,depth=5,rollout_temperature=0.5,budget=0.6` |
+
+After the build and the download of the weights, the whole entry is one
+command (`wss://HOST` is the tournament server):
+
+```sh
+python -m cfbot.arena_client wss://HOST ezgg \
+    --checkpoint weights/snapshots/arena-it24500.pt \
+    --deck executioner,archers,dart_goblin,zap,goblins,royal_ghost,mighty_miner,elixir_golem \
+    --search scope=all,cells=1,weight=20,depth=5,rollout_temperature=0.5,budget=0.6 \
+    --log matches.jsonl
+```
+
+- **The steps**, from an empty folder to a playing client (build, download
+  with checksums, a local check, what to watch while it plays):
+  [docs/arena-how-to-enter.md](docs/arena-how-to-enter.md).
+- **With Claude Code**: open this repository and ask it to enter the arena
+  tournament. The skill in
+  [.claude/skills/enter-arena-tournament](.claude/skills/enter-arena-tournament/SKILL.md)
+  follows the same steps with the same settings.
+- **What the bot is**, how it was trained and what was measured:
+  [docs/arena-model-and-training.md](docs/arena-model-and-training.md).
+
+Three things to check before the bracket is drawn:
+
+1. The client's first line names `arena-it24500.pt`. An older snapshot is a
+   weaker bot.
+2. The command has `--search` with `weight=20`. Without `--search` the bot
+   plays without look-ahead, which scored lower against the strongest
+   opponent it was tested on (0.52 against 0.60).
+3. `ezgg` is in the pool on `https://HOST/tournament`, and the client stays
+   running until the tournament is over. A bot that is not connected when the
+   bracket is drawn is not in it.
+
 ## Status
 
 The whole pipeline runs end to end and is covered by tests: environment bridge,
