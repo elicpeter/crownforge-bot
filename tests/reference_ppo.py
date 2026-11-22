@@ -1,5 +1,5 @@
 """Frozen copy of the PPO update as it was before the throughput work
-(commit a09ef80 plus the value_target knob). The tests compare the optimized
+(commit 223f26d plus the value_target knob). The tests compare the optimized
 update against it; do not edit it to make a test pass."""
 
 from __future__ import annotations

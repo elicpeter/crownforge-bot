@@ -1,5 +1,5 @@
 """Frozen copy of the network as it was before the throughput work
-(commit a09ef80 plus the board_kernel and value_target knobs). The tests load
+(commit 223f26d plus the board_kernel and value_target knobs). The tests load
 the same weights into this and into the current network and compare outputs
 and gradients; do not edit it to make a test pass."""
 from __future__ import annotations
