@@ -59,8 +59,21 @@ class Player:
         self.slowest_seconds = 0.0
         self.failed = False
 
-    def start(self) -> None:
-        self.featurizer.reset(self.deck)
+    def start(self, dealt: list[str] | None = None) -> list[str]:
+        """Start a match on `dealt`, the deck the server handed out for it, else our own.
+
+        Later games of a tournament series can be played on random decks the
+        server deals in `start`; the observations then show those cards. Returns
+        the deck the match is played on.
+        """
+        deck = list(dealt) if dealt else self.deck
+        try:
+            self.featurizer.reset(deck)
+        except Exception:  # never lose the match to a deck we cannot read: say so, play our own
+            traceback.print_exc()
+            deck = self.deck
+            self.featurizer.reset(deck)
+        return deck
 
     def act(self, obs: dict):
         """The reply to one observation: ``[slot, x, y]`` or ``None``."""
@@ -117,9 +130,10 @@ async def play(url: str, name: str, player: Player, log: str | None, matches: in
                 print(f"joined as {message['name']}, rating {message['rating']:.0f}", flush=True)
             elif kind == "start":
                 opponent, ticks, plays, ignored = message.get("opponent"), 0, 0, 0
-                player.start()
+                deck = player.start(message.get("deck"))
                 rated = "" if message.get("rated", True) else " (unrated)"
-                print(f"match against {opponent}{rated}", flush=True)
+                dealt = f", dealt deck {', '.join(deck)}" if message.get("deck") else ""
+                print(f"match against {opponent}{rated}{dealt}", flush=True)
             elif kind == "result":
                 finished += 1
                 mean_ms = 1000 * player.policy_seconds / max(1, player.decisions)
