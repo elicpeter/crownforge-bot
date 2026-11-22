@@ -2,8 +2,7 @@
 
 Steps for a person or an agent with a fresh checkout of this repository to put
 the bot on a cr-rl-arena server with the best deck, weights and play settings
-found so far. Why these were chosen, and what was measured, is in
-[arena-tournament-entry.md](arena-tournament-entry.md).
+found so far. What was measured for each choice is given next to it.
 
 ## What gets entered
 
@@ -209,8 +208,9 @@ head thinks of the positions reached to the policy's own preference.
 
 The gains are score against the same bot without look-ahead (0.5 is level,
 512 to 1,536 games each, error ±0.025 to ±0.04), on the snapshots of
-iterations 17050 and before. Tables and method:
-[arena-tournament-entry.md](arena-tournament-entry.md).
+iterations 17050 and before. The full tables, and how the deck was chosen,
+are in this repository's history: `docs/arena-tournament-entry.md` at commit
+`5940064`.
 
 Against opponents that are not its own copy the same setting gained between
 +0.15 (the policy trained to beat it on the same deck) and nothing (older

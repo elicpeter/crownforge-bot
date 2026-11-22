@@ -637,10 +637,8 @@ the candidates. Training does not change; this is a setting of the client.
   reached; `horizon` is then not used. `rollout_temperature` below 1 makes the
   imagined players less random, `samples` averages several tries per
   candidate, and `budget=SECONDS` stops a decision's look-ahead in time for a
-  server that waits only so long. What was measured with it, and the setting
-  the tournament entry uses, is in
-  [docs/arena-tournament-entry.md](docs/arena-tournament-entry.md). The steps
-  to enter with that setting are in
+  server that waits only so long. The setting the tournament entry uses, what
+  was measured for it and the steps to enter with it are in
   [docs/arena-how-to-enter.md](docs/arena-how-to-enter.md).
 
 The engine is nearly deterministic (its random numbers go to the deck shuffle
