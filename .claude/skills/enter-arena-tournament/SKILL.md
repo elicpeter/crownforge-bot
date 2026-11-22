@@ -15,10 +15,10 @@ or new measurements arrive.
 
 ## Rules that the file also states, here so they are not missed
 
-- You need two things that are not in the repository: the server address
-  (`wss://...`) and the name to play under. Ask the user for them. Never guess
-  either, and never connect to a tournament server under a name the user did
-  not give you.
+- The name to play under is `ezgg`, as the file says. The server address
+  (`wss://...`) is not in the repository: ask the user for it and never guess
+  it. Never connect to a tournament server under another name unless the user
+  gives you one.
 - Weights: always the snapshot with the highest iteration number in the GitHub
   release, whatever it is. A missing rating is no reason to take an older one.
 - Deck and look-ahead settings: exactly as in the file. Change a setting only

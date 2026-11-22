@@ -62,16 +62,15 @@ joined, waited in the pool, and the stand-in organiser drew a best-of-3
 bracket against the simulator's random player and ran it at real-time speed.
 Two wins, 0 ignored moves, slowest decision 330 ms.
 
-## Two things you must be given
+## The name and the server address
 
-They are not in this repository:
-
-- the server address (`wss://...`)
-- the name to play under (the rating and the place in the bracket are kept
-  per name)
-
-An organiser running this bot for the team has the address already and needs
-only the team's name from the team. Anyone else: ask for both. Do not guess.
+- The name to play under is `ezgg`. The rating and the place in the bracket
+  are kept per name, so use exactly this, in lower case, every time. Names
+  are not protected on the server: if another `ezgg` is already in the pool,
+  tell the organiser before the bracket is drawn.
+- The server address (`wss://...`) is not in this repository. An organiser
+  running this bot for the team has it already. Anyone else: ask for it. Do
+  not guess.
 
 ## 1. Build
 
@@ -151,13 +150,13 @@ Go on only if all of these hold:
 
 ## 4. Enter
 
-    python -m cfbot.arena_client wss://HOST NAME \
+    python -m cfbot.arena_client wss://HOST ezgg \
         --checkpoint weights/snapshots/$SNAP \
         --deck executioner,archers,dart_goblin,zap,goblins,royal_ghost,mighty_miner,elixir_golem \
         --search scope=all,cells=1,weight=40,depth=5,rollout_temperature=0.5,budget=0.6 \
         --log matches.jsonl
 
-The client prints `joined as NAME` and then waits in the pool until the
+The client prints `joined as ezgg` and then waits in the pool until the
 organiser starts a game; that can take a long time and prints nothing. It
 plays every game it is given, goes back to the pool, and joins again by itself
 if the connection drops. Check `https://HOST/tournament` for the name. Do not
