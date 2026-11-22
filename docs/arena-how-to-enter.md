@@ -11,7 +11,7 @@ found so far. What was measured for each choice is given next to it.
 | deck | `executioner,archers,dart_goblin,zap,goblins,royal_ghost,mighty_miner,elixir_golem` |
 | weights | the snapshot with the highest iteration number in the GitHub release `arena-weights-2026-11-17` |
 | play | sampled (the default), with look-ahead |
-| look-ahead | `scope=all,cells=1,weight=40,depth=5,rollout_temperature=0.5,budget=0.6` |
+| look-ahead | `scope=all,cells=1,weight=20,depth=5,rollout_temperature=0.5,budget=0.6` |
 
 Always take the newest snapshot, the `arena-itNNNNN.pt` with the highest
 number, whatever it is when you read this. Do not pick one by its rating: the
@@ -127,7 +127,7 @@ A server on this machine and the simulator's own random player as the opponent:
     python -m cfbot.arena_client ws://127.0.0.1:8765 check \
         --checkpoint weights/snapshots/$SNAP \
         --deck executioner,archers,dart_goblin,zap,goblins,royal_ghost,mighty_miner,elixir_golem \
-        --search scope=all,cells=1,weight=40,depth=5,rollout_temperature=0.5,budget=0.6 \
+        --search scope=all,cells=1,weight=20,depth=5,rollout_temperature=0.5,budget=0.6 \
         --matches 3
 
 The server installed here is the one of commit `21615a82`, which pairs waiting
@@ -153,7 +153,7 @@ Go on only if all of these hold:
     python -m cfbot.arena_client wss://HOST ezgg \
         --checkpoint weights/snapshots/$SNAP \
         --deck executioner,archers,dart_goblin,zap,goblins,royal_ghost,mighty_miner,elixir_golem \
-        --search scope=all,cells=1,weight=40,depth=5,rollout_temperature=0.5,budget=0.6 \
+        --search scope=all,cells=1,weight=20,depth=5,rollout_temperature=0.5,budget=0.6 \
         --log matches.jsonl
 
 The client prints `joined as ezgg` and then waits in the pool until the
@@ -198,7 +198,7 @@ head thinks of the positions reached to the policy's own preference.
 |---|---|---|---|
 | `scope=all` | keep | waiting, every playable card and the ability are compared | `scope=tile` (only where to put the card the policy chose) gained 0.02; `all` gained 0.09 on the same snapshot |
 | `cells=1` | keep | per card, only its most likely tile | more tiles per card take longer and have not been measured with `scope=all` |
-| `weight=40` | keep | how much the look-ahead counts against the policy's preference | 10: +0.04, 20: +0.06, 40: +0.11, 80: +0.02 to +0.07 |
+| `weight=20` | keep | how much the look-ahead counts against the policy's preference | on the newest weights 20: +0.05, 40: +0.01 against its own copy, and both +0.08 against the counter policy (table below); on the snapshot of iteration 17050 it was 10: +0.04, 20: +0.06 to +0.09, 40: +0.11, 80: +0.02 to +0.07 |
 | `depth=5` | keep; `3` if the machine is slow | decisions looked ahead (5 is 1.5 s of game time) | 3: +0.07 to +0.09, 5: +0.11, 7: no more than 5, at 40% more time per move |
 | `rollout_temperature=0.5` | keep | how much chance there is in the imagined play | 0.5 a little better than 1.0 and 0.25 over 1,536 games, inside the error |
 | `budget=0.6` | keep; lower if moves are late | seconds after which a move's look-ahead stops and is valued where it is | no effect on strength while moves take less; see the next section |
@@ -207,14 +207,44 @@ head thinks of the positions reached to the policy's own preference.
 
 The gains are score against the same bot without look-ahead (0.5 is level,
 512 to 1,536 games each, error ±0.025 to ±0.04), on the snapshots of
-iterations 17050 and before. The full tables, and how the deck was chosen,
+iterations 17050 and before, except where the newest weights are named. The full tables, and how the deck was chosen,
 are in this repository's history: `docs/arena-tournament-entry.md` at commit
 `5940064`.
 
-Against opponents that are not its own copy the same setting gained between
-+0.15 (the policy trained to beat it on the same deck) and nothing (older
-snapshots it already beats nine times in ten). It lost nothing that the
-matches could show.
+Against opponents that are not its own copy the look-ahead (then at
+`weight=40`) gained between +0.15 (the policy trained to beat it on the same
+deck) and nothing (older snapshots it already beats nine times in ten). It
+lost nothing that the matches could show.
+
+### Measured on the newest weights
+
+On 2026-11-22 the settings were played again with the snapshot of iteration
+24350, which rates level with the newest (24500). The bot on the tournament
+deck, sampled play, 512 games per cell, the same games in every cell of a
+row, none crashed. Each cell is ±0.04. All look-ahead settings are
+`scope=all,cells=1,depth=5,rollout_temperature=0.5`.
+
+| opponent | no look-ahead | `weight=20` | `weight=40` |
+|---|---|---|---|
+| its own copy without look-ahead, eight decks, first set of games | 0.667 | 0.698 | 0.646 |
+| the same, second set of games | 0.605 | 0.668 | 0.637 |
+| counter c, the newest: a policy trained to beat the bot on its own deck | 0.518 | 0.596 | 0.596 |
+| counter a, the newest: trained to beat it with four attacking decks | 0.802 | not played | 0.805 |
+| counter b, the newest: trained to beat it with the pool decks | 0.832 | not played | not played |
+
+Against its own copy `weight=20` gained +0.03 and +0.06, `weight=40` -0.02
+and +0.03: over both sets +0.047 and +0.005. Against counter c both gained
++0.078, with the same count of wins (305 of 512). On the snapshot of
+iteration 17050 `weight=40` had been the better of the two against its own
+copy (0.763 against 0.736 over 1,536 games); on the newest weights it is not.
+`weight=20` is the entry's setting because it was at least as good as
+`weight=40` in every row where both were played. The differences between the
+two weights are inside the error of single matches; what the rows agree on is
+that `weight=20` is never the worse one, and that look-ahead of either weight
+gains against the opponent the bot finds hardest.
+
+The look-ahead changed about 2% of the decisions at `weight=20` and 2.7% at
+`weight=40`.
 
 ## Fit the look-ahead to the machine
 
@@ -286,8 +316,9 @@ Each match prints one line, as in step 3. Read these:
   one.
 
 Do not take `--search` away to save time unless moves are being missed even
-at `depth=3`: against a copy of itself without look-ahead, the bot scored
-0.763 with this setting and 0.648 without it (an earlier snapshot, 1,536
+at `depth=3`: with this setting the newest weights scored 0.683 against a
+copy without look-ahead where the bot without look-ahead scored 0.636 (1,024
+games), and 0.596 against 0.518 against the policy trained to beat it (512
 games).
 
 ## Not verified
