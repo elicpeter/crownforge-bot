@@ -18,8 +18,9 @@ Always take the newest snapshot, the `arena-itNNNNN.pt` with the highest
 number, whatever it is when you read this. Do not pick one by its rating: the
 newest ones have none in the release notes, because the run went on after the
 last rating was measured, and a missing rating is no reason to step back to an
-older file. Step 2 finds the file for you. When this was written it was
-`arena-it18800.pt`.
+older file. Step 2 finds the file for you. When this was last updated
+(2026-11-22) it was `arena-it24350.pt`, taken about an hour before the run's
+end.
 
 The deck must stay this one. From iteration 16,868 on the run trained on this
 deck alone.
@@ -113,23 +114,130 @@ Go on only if all of these hold:
 The client joins the queue, plays match after match and joins again if the
 connection drops. Stop it with Ctrl-C. `--matches N` stops it after N matches.
 
+## Every setting, and which to leave alone
+
+The command in step 4 is the whole entry. Nothing else needs setting. This
+section says what each part does, so that you change something only for a
+reason given here.
+
+### The client's options
+
+| option | use | why |
+|---|---|---|
+| `--checkpoint` | `weights/snapshots/$SNAP` | the newest snapshot, from step 2 |
+| `--deck` | the eight cards above, in any order | the only deck the last 7,500 iterations trained on; play with other decks has not been measured since |
+| `--search` | the look-ahead line above | worth about +0.1 of score against the bot's own copy, see below |
+| `--device` | leave out (`cpu`) | fast enough, and what was tested; `cuda` only on a GPU nothing else uses |
+| `--mode` | leave out (`sample`) | `greedy` scored the same in 1,024 games (0.497 against 0.499), and a bot that always plays the same move is easier to read |
+| `--temperature` | leave out (1.0) | 0.8, 0.6 and 0.4 scored 0.497, 0.509 and 0.534 against 0.499 over 1,024 games each, without look-ahead: no gain shown; not measured together with look-ahead |
+| `--ema` | leave out | does nothing with a release snapshot, which holds one set of weights |
+| `--seed` | leave out | a new one each start |
+| `--log FILE` | set it | one JSON line per match; the only record of how it went |
+| `--matches N` | leave out, except for the local check | without it the client plays until stopped |
+
+The client uses at most four CPU threads, by itself. Do not set thread
+counts.
+
+### The look-ahead's settings
+
+Before each move the bot plays every candidate move forward in the simulator,
+with both players going on to play from the policy, and adds what its value
+head thinks of the positions reached to the policy's own preference.
+
+| setting | use | what it is | what was measured |
+|---|---|---|---|
+| `scope=all` | keep | waiting, every playable card and the ability are compared | `scope=tile` (only where to put the card the policy chose) gained 0.02; `all` gained 0.09 on the same snapshot |
+| `cells=1` | keep | per card, only its most likely tile | more tiles per card take longer and have not been measured with `scope=all` |
+| `weight=40` | keep | how much the look-ahead counts against the policy's preference | 10: +0.04, 20: +0.06, 40: +0.11, 80: +0.02 to +0.07 |
+| `depth=5` | keep; `3` if the machine is slow | decisions looked ahead (5 is 1.5 s of game time) | 3: +0.07 to +0.09, 5: +0.11, 7: no more than 5, at 40% more time per move |
+| `rollout_temperature=0.5` | keep | how much chance there is in the imagined play | 0.5 a little better than 1.0 and 0.25 over 1,536 games, inside the error |
+| `budget=0.6` | keep; lower if moves are late | seconds after which a move's look-ahead stops and is valued where it is | no effect on strength while moves take less; see the next section |
+| `samples` | leave out (1) | lines played per candidate | `samples=2` gained no more than `weight=40` and takes three times as long |
+| `horizon` | leave out | not used when `depth` is set | |
+
+The gains are score against the same bot without look-ahead (0.5 is level,
+512 to 1,536 games each, error ±0.025 to ±0.04), on the snapshots of
+iterations 17050 and before. Tables and method:
+[arena-tournament-entry.md](arena-tournament-entry.md).
+
+Against opponents that are not its own copy the same setting gained between
++0.15 (the policy trained to beat it on the same deck) and nothing (older
+snapshots it already beats nine times in ten). It lost nothing that the
+matches could show.
+
+## Fit the look-ahead to the machine
+
+The setting is as strong on a slow machine as on a fast one as long as the
+move arrives in time. A late move is not played at all, and ten late moves in
+a row end the match. So the one thing to fit to the machine is time.
+
+1. Find the server's time per move. The simulator's default is 2.0 s
+   (`CR_MOVE_TIMEOUT`); ask whether the tournament changed it.
+2. Run step 3 on the machine that will play, with nothing else heavy running.
+   Read `ms per decision` and `slowest so far` from the last match line.
+3. Pick the first row that fits:
+
+| slowest decision in step 3 | use |
+|---|---|
+| under a third of the server's time (under 650 ms at 2.0 s) | the setting as it is |
+| up to half of it | `budget=0.4` in place of `budget=0.6` |
+| more than half, or `ignored` above 0 | `depth=3,budget=0.4` |
+| still `ignored` above 0 | no `--search` at all (about 25 ms a move) |
+
+The rows are a rule of thumb, not a measurement. Measured, CPU, four threads,
+on an M2 Max: the setting took 145 to 250 ms a decision on average, and the
+slowest decision of a check was between 230 and 620 ms. With other work
+loading every core of the same machine one decision took 1,444 ms and the
+look-ahead was cut short 16 times in three matches; two minutes later, with
+less load, the slowest was 316 ms. `depth=3` took 151 ms on average where
+`depth=5` took 247 ms.
+
+The time cap is a target and not a promise: the first step of every line is
+always played, so a decision can run past `budget`. Leave the distance to the
+server's limit that the table leaves.
+
+If the server gives less than 1.0 s per move, start from `depth=3,budget=0.3`
+and check `ignored` in step 3 against a local server started with the same
+limit (`CR_MOVE_TIMEOUT=1.0 CR_ARENA_BIND=127.0.0.1:8765 cr-arena`). This
+case has not been run.
+
+## Keep it running
+
+- Run the client alone on its machine: no training, no builds, no video call.
+- Plug the machine in and keep it awake for as long as the tournament runs.
+  On macOS start the client under `caffeinate -i` (put it in front of
+  `python`); a closed lid still puts a laptop to sleep. On Windows set sleep
+  to "never" while plugged in.
+- Use a wired or steady connection. A connection that drops in the middle of a
+  match forfeits that match; the client then joins again by itself.
+- Start it in a terminal that stays open (`tmux`, `screen`, or a window nobody
+  closes). Stop it with Ctrl-C only between matches if you can: stopping in a
+  match forfeits it.
+- Use one client per name. Two clients under one name have not been tried.
+- Do not restart it to change settings while it is winning. Every restart
+  costs the match in progress.
+
 ## While it plays
 
-- Run the client alone on its machine. The server waits 2 s for a move by
-  default and gives up on a player after 10 missed moves in a row. With other
-  heavy work on the same machine a decision took up to 1.4 s; alone it took at
-  most 0.6 s.
-- `--device cuda` makes the look-ahead faster where there is a GPU that
-  nothing else is using. The CPU is fast enough without it.
-- `ignored` above 0 means moves arrived too late or were refused. If it keeps
-  growing, lower the time cap (`budget=0.4`). If that is not enough, lower
-  `depth=3`. Both cost some strength; a missed move costs more.
-- `look-ahead cut short N times` is the time cap at work. A few are harmless.
-- A connection that drops in the middle of a match forfeits that match.
-- Do not take `--search` away to save time unless moves are being missed even
-  at `depth=3`: against a copy of itself without look-ahead, the bot scored
-  0.763 with this setting and 0.648 without it (an earlier snapshot, 1,536
-  games).
+Each match prints one line, as in step 3. Read these:
+
+- `ignored` above 0: moves arrived too late or were refused. One or two in a
+  long session are no worry. If the number grows from match to match, stop
+  between matches and go one row down in the table above.
+- `look-ahead cut short N times`: the time cap at work. A few per match are
+  harmless. Dozens per match mean the machine is too slow or busy: free it,
+  or go one row down.
+- `slowest so far` near the server's limit: the same.
+- A Python traceback: the client has stopped. Start it again with the same
+  command; the rating is kept by the server under the name.
+- Losses alone are no reason to change anything. The settings were chosen over
+  thousands of games; a handful of tournament matches cannot show a better
+  one.
+
+Do not take `--search` away to save time unless moves are being missed even
+at `depth=3`: against a copy of itself without look-ahead, the bot scored
+0.763 with this setting and 0.648 without it (an earlier snapshot, 1,536
+games).
 
 ## Not verified
 
@@ -144,9 +252,15 @@ connection drops. Stop it with Ctrl-C. `--matches N` stops it after N matches.
   release got `arena-it18800.pt`: step 2 found that file, and the result was
   three wins, 0 ignored, slowest decision 336 ms. The Windows script was not
   run again, and step 2 is written for a Unix shell.
-- The newest snapshots have no rating. `arena-it18800.pt` has only been checked
+- Steps 2 and 3 were run again on 2026-11-22 with `arena-it22400.pt` and with
+  `arena-it24350.pt`: three wins each, 0 ignored, slowest decision 316 ms and
+  314 ms. A first try with `arena-it22400.pt` on a machine busy with other
+  work gave a slowest decision of 1,444 ms.
+- The newest snapshots have no rating. `arena-it24350.pt` has only been checked
   to load and to beat the random player; that it is stronger than
   `arena-it17700.pt` is expected from the run's trend, not measured.
+- A server limit other than 2.0 s per move, `--device cuda` for the client,
+  and two clients under one name have not been tried.
 - The time per move was measured on a laptop, not on the machine that will
   play.
 - Step 4 has only been run against a server on the same machine.
